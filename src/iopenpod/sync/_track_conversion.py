@@ -17,7 +17,13 @@ from iopenpod.itunesdb_shared.constants import (
 )
 from iopenpod.itunesdb_writer.mhit_writer import TrackInfo
 
-from ._formats import CODEC_AAC, CODEC_ALAC, CODEC_MP3, normalize_codec
+from ._formats import (
+    CODEC_AAC,
+    CODEC_ALAC,
+    CODEC_MP3,
+    average_bitrate_kbps,
+    normalize_codec,
+)
 
 # Filetype string → writer filetype code.  Checked in order; first
 # substring match wins.  Falls back to "mp3".
@@ -231,8 +237,9 @@ def pc_track_to_info(
     rating = pc_track.rating or 0
 
     # File size: use actual iPod file size (especially important after transcode)
-    if ipod_file_path and ipod_file_path.exists():
-        file_size = ipod_file_path.stat().st_size
+    have_output_file = bool(ipod_file_path and ipod_file_path.exists())
+    if have_output_file:
+        file_size = ipod_file_path.stat().st_size  # type: ignore[union-attr]
     else:
         file_size = pc_track.size or 0
 
@@ -242,15 +249,28 @@ def pc_track_to_info(
     bitrate = pc_track.bitrate or 0
     sample_rate = pc_track.sample_rate or 44100
     if was_transcoded:
-        # Lossless sources (.flac, .wav, .aif, .aiff) transcode to ALAC —
-        # keep the source bitrate.  Lossy sources (.ogg, .opus, .wma) go
-        # to AAC — use the user-configured bitrate.
+        # Lossy sources (.ogg, .opus, .wma) go to AAC — use the
+        # user-configured bitrate.
         source_ext = pc_track.extension.lower().lstrip(".")
         is_lossless_source = source_ext in ("flac", "wav", "aif", "aiff")
         if filetype == "m4a" and not is_lossless_source:
             from .transcoder import quality_to_nominal_bitrate, resolve_transcode_plan
             plan = resolve_transcode_plan(pc_track.path)
             bitrate = quality_to_nominal_bitrate(plan.effective_quality)
+        elif is_lossless_source and have_output_file:
+            # Lossless sources transcode to ALAC (or AAC under prefer_lossy).
+            # Either way the source bitrate describes a different file, so
+            # measure the output we actually wrote.  Resampling preserves
+            # duration, so the source duration holds even when the sample
+            # rate was capped.
+            #
+            # Requires a real output file: without one ``file_size`` is the
+            # *source* size, and measuring that would dress up a guess as a
+            # measurement.  Restricted to lossless audio sources because for
+            # video, size over duration is the muxed rate, not the audio rate.
+            measured = average_bitrate_kbps(file_size, pc_track.duration_ms)
+            if measured:
+                bitrate = measured
         # Transcoded audio is capped at IPOD_MAX_SAMPLE_RATE; reflect that
         # in the stored sample_rate so iTunesDB is consistent with the file.
         if filetype == "m4a":

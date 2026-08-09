@@ -25,6 +25,21 @@ LOSSLESS_CODECS: frozenset[str] = frozenset({
 })
 
 
+def average_bitrate_kbps(size_bytes: int | None, duration_ms: int | None) -> int | None:
+    """Return the true average bitrate in kbps for a file of known size.
+
+    ``size_bytes * 8 / duration_ms`` is already kbits per second, so no unit
+    scaling is needed.  Returns ``None`` when either input is missing or
+    non-positive, which callers treat as "keep the value you already had".
+
+    Used wherever a container reports no usable bitrate (ALAC) or where the
+    only bitrate on hand describes a different file (a transcode source).
+    """
+    if not size_bytes or not duration_ms or size_bytes <= 0 or duration_ms <= 0:
+        return None
+    return round(size_bytes * 8 / duration_ms)
+
+
 def normalize_codec(raw: str | None) -> str:
     """Map a probed codec name to a canonical short name.
 

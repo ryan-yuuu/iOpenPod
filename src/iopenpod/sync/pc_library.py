@@ -35,6 +35,7 @@ from ._formats import (
     MEDIA_EXTENSIONS,
     NEEDS_TRANSCODING,
     VIDEO_EXTENSIONS,
+    average_bitrate_kbps,
     normalize_codec,
 )
 from .source_identity import mp4_duration_ms
@@ -272,15 +273,13 @@ def _average_bitrate_kbps(filename: str | None, duration_ms: int | None) -> int 
     Returns ``None`` when either input is missing or the file is unreadable —
     callers keep whatever value they already had.
     """
-    if not filename or not duration_ms or duration_ms <= 0:
+    if not filename:
         return None
     try:
         size_bytes = os.path.getsize(filename)
     except OSError:
         return None
-    if size_bytes <= 0:
-        return None
-    return round(size_bytes * 8 / duration_ms)
+    return average_bitrate_kbps(size_bytes, duration_ms)
 
 
 def _extract_gapless_info(audio) -> dict:
