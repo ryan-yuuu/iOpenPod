@@ -810,7 +810,7 @@ def test_converted_track_dict_builds_dataset3_podcast_playlist() -> None:
     ]
 
 
-def test_podcast_playlist_is_created_in_dataset3_when_missing() -> None:
+def test_podcast_playlist_is_created_in_both_datasets_when_missing() -> None:
     podcast = TrackInfo(
         title="Episode",
         location=":iPod_Control:Music:F00:PODC.mp3",
@@ -828,10 +828,14 @@ def test_podcast_playlist_is_created_in_dataset3_when_missing() -> None:
         [podcast],
     )
 
-    assert playlists == []
-    assert [(playlist.name, playlist.track_ids, playlist.podcast_flag) for playlist in podcast_playlists] == [
-        ("Podcasts", [100], 1)
-    ]
+    # iTunes writes the Podcasts playlist into dataset 2 (flat MHIPs) as well as
+    # dataset 3 (grouped under show headers). The firmware resolves episode
+    # membership from dataset 2, so creating it in dataset 3 alone renders the
+    # show with no episodes under it.
+    expected = [("Podcasts", [100], 1)]
+    assert [(playlist.name, playlist.track_ids, playlist.podcast_flag) for playlist in playlists] == expected
+    assert [(playlist.name, playlist.track_ids, playlist.podcast_flag) for playlist in podcast_playlists] == expected
+    assert playlists[0].playlist_id == podcast_playlists[0].playlist_id
 
 
 def test_smart_playlist_playlist_rules_use_referenced_playlist_ids() -> None:

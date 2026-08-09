@@ -16,7 +16,11 @@ from iopenpod.itunesdb_shared.playlist_properties import (
 )
 from iopenpod.itunesdb_writer.mhit_writer import TrackInfo
 from iopenpod.itunesdb_writer.mhod_spl_writer import prefs_from_parsed, rules_from_parsed
-from iopenpod.itunesdb_writer.mhyp_writer import PlaylistInfo, PlaylistItemMeta
+from iopenpod.itunesdb_writer.mhyp_writer import (
+    PlaylistInfo,
+    PlaylistItemMeta,
+    generate_playlist_id,
+)
 
 from .path_identity import coerce_int, stable_path_key
 
@@ -317,29 +321,52 @@ def _sync_podcast_playlist_membership(
     podcast_playlists: list[PlaylistInfo],
     all_track_infos: list[TrackInfo],
 ) -> None:
-    """Keep the special Podcasts playlist aligned with podcast track contents."""
+    """Keep the special Podcasts playlist aligned with podcast track contents.
+
+    iTunes writes the Podcasts playlist into *both* dataset 2 (flat MHIPs) and
+    dataset 3 (episodes grouped under show headers), sharing one playlist ID.
+    The firmware resolves episode membership from dataset 2, so a playlist
+    present in only one dataset renders the show with no episodes under it.
+    Each dataset therefore gets an entry.
+    """
 
     podcast_db_track_ids = [
         track.db_track_id
         for track in all_track_infos
         if track.db_track_id and _is_podcast_track(track)
     ]
-    targets = [
-        playlist
-        for playlist in [*playlists, *podcast_playlists]
-        if playlist.podcast_flag
+    datasets = (playlists, podcast_playlists)
+    per_dataset = [
+        [playlist for playlist in dataset if playlist.podcast_flag]
+        for dataset in datasets
     ]
 
-    if not targets and podcast_db_track_ids:
-        podcast_playlist = PlaylistInfo(
-            name="Podcasts",
-            track_ids=[],
-            podcast_flag=1,
+    if podcast_db_track_ids and not all(per_dataset):
+        # Both copies describe one playlist, so they share its identity.
+        shared_id = next(
+            (
+                playlist.playlist_id
+                for found in per_dataset
+                for playlist in found
+                if playlist.playlist_id is not None
+            ),
+            None,
         )
-        podcast_playlists.append(podcast_playlist)
-        targets.append(podcast_playlist)
+        if shared_id is None:
+            shared_id = generate_playlist_id()
+        for dataset, found in zip(datasets, per_dataset, strict=True):
+            if found:
+                continue
+            created = PlaylistInfo(
+                name="Podcasts",
+                track_ids=[],
+                podcast_flag=1,
+                playlist_id=shared_id,
+            )
+            dataset.append(created)
+            found.append(created)
 
-    for playlist in targets:
+    for playlist in [playlist for found in per_dataset for playlist in found]:
         if playlist.track_ids != podcast_db_track_ids:
             logger.info(
                 "Podcast playlist '%s': synced to %d podcast track(s)",
