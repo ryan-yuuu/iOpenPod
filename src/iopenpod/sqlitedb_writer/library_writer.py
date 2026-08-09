@@ -30,17 +30,41 @@ AUDIO_FORMAT_ALAC = 0x01F7  # 503
 AUDIO_FORMAT_WAV = 0x006E   # 110
 AUDIO_FORMAT_AIFF = 0x006F  # 111
 
+# Container/iTunesDB filetype → audio_format.  Used when the codec is
+# unknown; .m4a defaults to AAC because it is by far the common case.
 _FILETYPE_TO_AUDIO_FORMAT = {
     'mp3': AUDIO_FORMAT_MP3,
     'aac': AUDIO_FORMAT_AAC,
     'm4a': AUDIO_FORMAT_AAC,
     'm4p': AUDIO_FORMAT_AAC,
     'm4b': AUDIO_FORMAT_AAC,
-    'alac': AUDIO_FORMAT_ALAC,
     'wav': AUDIO_FORMAT_WAV,
     'aif': AUDIO_FORMAT_AIFF,
     'aiff': AUDIO_FORMAT_AIFF,
 }
+
+# Codec → audio_format.  Authoritative when known: the .m4a container holds
+# both AAC and ALAC, so only the codec distinguishes them.
+_CODEC_TO_AUDIO_FORMAT = {
+    'alac': AUDIO_FORMAT_ALAC,
+    'aac': AUDIO_FORMAT_AAC,
+    'mp3': AUDIO_FORMAT_MP3,
+    'pcm': AUDIO_FORMAT_WAV,
+}
+
+
+def _audio_format_for(filetype: str, codec: str) -> int:
+    """Return the ``avformat_info.audio_format`` value for a track.
+
+    Prefers the probed codec, which is the only thing that separates ALAC
+    from AAC inside an .m4a container.  Falls back to the container filetype
+    when the codec is unknown — e.g. tracks restored from mapping data
+    written before the codec was recorded.
+    """
+    fmt = _CODEC_TO_AUDIO_FORMAT.get((codec or '').lower())
+    if fmt is not None:
+        return fmt
+    return _FILETYPE_TO_AUDIO_FORMAT.get(filetype, AUDIO_FORMAT_MP3)
 
 # ── Media kind flags ───────────────────────────────────────────────────
 # item.media_kind in the SQLite database. These differ from the binary
@@ -1005,11 +1029,7 @@ def write_library_itdb(
 
             # ── avformat_info ──────────────────────────────────────────────
             ft = track.filetype.lower()
-            audio_format = _FILETYPE_TO_AUDIO_FORMAT.get(ft, AUDIO_FORMAT_MP3)
-            # Detect ALAC: M4A container + high bitrate (ALAC >= ~500 kbps,
-            # AAC caps at ~330 kbps)
-            if ft in ('m4a', 'm4b') and track.bitrate > 500:
-                audio_format = AUDIO_FORMAT_ALAC
+            audio_format = _audio_format_for(ft, track.codec)
             # Duration in avformat_info is in SAMPLES, not milliseconds.
             # libgpod writes 0 ("iTunes sometimes set it to 0"); we compute
             # when sample_rate is available, else 0.

@@ -7,6 +7,47 @@ transcoder, integrity, and sync_executor.
 
 from __future__ import annotations
 
+# ── Audio codecs ─────────────────────────────────────────────────────────────
+#
+# The container extension does not identify the codec: ``.m4a`` holds both AAC
+# and ALAC.  Writers that must record the real codec (the SQLite
+# ``avformat_info.audio_format`` column) need the codec itself, so it is
+# carried on PCTrack/TrackInfo rather than re-derived downstream.
+
+# Canonical codec names used across the sync layer.
+CODEC_ALAC = "alac"
+CODEC_AAC = "aac"
+CODEC_MP3 = "mp3"
+
+# Codecs that are lossless — these must never be inferred from bitrate.
+LOSSLESS_CODECS: frozenset[str] = frozenset({
+    CODEC_ALAC, "flac", "wav", "aiff", "pcm",
+})
+
+
+def normalize_codec(raw: str | None) -> str:
+    """Map a probed codec name to a canonical short name.
+
+    Accepts both mutagen's MP4 codec strings (``"mp4a.40.2"``, ``"alac"``)
+    and ffprobe's ``codec_name`` values (``"aac"``, ``"alac"``, ``"mp3"``).
+    Returns ``""`` when the codec is unknown, which callers treat as
+    "fall back to inference" rather than as a specific codec.
+    """
+    codec = (raw or "").strip().lower()
+    if not codec:
+        return ""
+    if codec.startswith("alac"):
+        return CODEC_ALAC
+    # MP4 audio object types: "mp4a.40.2" (AAC-LC), "mp4a.40.5" (HE-AAC), ...
+    if codec.startswith("mp4a") or codec == "aac":
+        return CODEC_AAC
+    if codec.startswith("mp3") or codec in {"mp4a.6b", "mp4a.69"}:
+        return CODEC_MP3
+    if codec.startswith("pcm_"):
+        return "pcm"
+    return codec
+
+
 # ── Audio extensions ─────────────────────────────────────────────────────────
 
 # Formats the iPod can play natively (audio only, no transcoding needed)

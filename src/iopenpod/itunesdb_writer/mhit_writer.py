@@ -71,6 +71,11 @@ class TrackInfo:
     bitrate: int = 0  # kbps
     sample_rate: int = 44100  # Hz
     vbr: bool = False
+    # Audio codec ("alac", "aac", "mp3", ...); "" when unknown.  Distinct from
+    # ``filetype``, which is the container/iTunesDB type: an .m4a is filetype
+    # "m4a" whether its codec is AAC or ALAC, and the SQLite database records
+    # the two with different audio_format values.
+    codec: str = ''
 
     # Metadata
     artist: str | None = None

@@ -31,9 +31,11 @@ from iopenpod.infrastructure.media_folders import (
 
 from ._formats import (
     AUDIO_EXTENSIONS,
+    LOSSLESS_CODECS,
     MEDIA_EXTENSIONS,
     NEEDS_TRANSCODING,
     VIDEO_EXTENSIONS,
+    normalize_codec,
 )
 from .source_identity import mp4_duration_ms
 
@@ -260,6 +262,27 @@ def _coerce_mp4_freeform_text(value) -> str:
         return ""
 
 
+def _average_bitrate_kbps(filename: str | None, duration_ms: int | None) -> int | None:
+    """Return the true average bitrate in kbps from file size and duration.
+
+    Used for codecs where the container reports no usable bitrate (ALAC
+    reports 0 or the uncompressed PCM rate).  ``size_bytes * 8 / duration_ms``
+    is already kbits per second, so no unit scaling is needed.
+
+    Returns ``None`` when either input is missing or the file is unreadable —
+    callers keep whatever value they already had.
+    """
+    if not filename or not duration_ms or duration_ms <= 0:
+        return None
+    try:
+        size_bytes = os.path.getsize(filename)
+    except OSError:
+        return None
+    if size_bytes <= 0:
+        return None
+    return round(size_bytes * 8 / duration_ms)
+
+
 def _extract_gapless_info(audio) -> dict:
     """Extract gapless playback info from mutagen audio object.
 
@@ -371,7 +394,7 @@ def probe_gapless_info(path) -> dict:
     postgap, and net PCM sample count values.
 
     Returns a dict with any subset of: pregap, postgap, sample_count,
-    sample_rate.  Returns an empty dict on any read error.
+    sample_rate, codec.  Returns an empty dict on any read error.
     """
     if not MUTAGEN_AVAILABLE or mutagen is None:
         return {}
@@ -400,6 +423,12 @@ def probe_gapless_info(path) -> dict:
             sr = getattr(info, "sample_rate", 0)
             if sr:
                 result["sample_rate"] = sr
+            # Codec of the file as it actually exists on disk.  For transcode
+            # outputs this is the only reliable source — the target format can
+            # differ from what the source extension would imply.
+            codec = normalize_codec(getattr(info, "codec", ""))
+            if codec:
+                result["codec"] = codec
         return result
     except Exception:
         return {}
@@ -432,6 +461,12 @@ class PCTrack:
     bitrate: int | None  # Bitrate in kbps
     sample_rate: int | None  # Sample rate in Hz
     rating: int | None  # Rating 0-100 (stars × 20, same as iPod)
+
+    # Audio codec, canonicalized by _formats.normalize_codec ("alac", "aac",
+    # "mp3", ...).  Empty when the codec could not be determined.  The
+    # container extension cannot stand in for this: .m4a holds both AAC and
+    # ALAC, and the iPod databases record the two differently.
+    codec: str = ""
 
     # Sort tags (for proper ordering on iPod)
     sort_artist: str | None = None
@@ -925,6 +960,7 @@ class PCLibrary:
             bitrate=metadata.get("bitrate"),
             sample_rate=metadata.get("sample_rate"),
             rating=metadata.get("rating"),
+            codec=metadata.get("codec", ""),
             sort_artist=metadata.get("sort_artist"),
             sort_name=metadata.get("sort_name"),
             sort_album=metadata.get("sort_album"),
@@ -1053,6 +1089,19 @@ class PCLibrary:
                 metadata["bitrate"] = int(audio.info.bitrate) // 1000 if audio.info.bitrate else None
             if hasattr(audio.info, "sample_rate"):
                 metadata["sample_rate"] = int(audio.info.sample_rate)
+            # Codec identity.  Already parsed by mutagen when it built ``info``
+            # (from the MP4 sample-description atom), so reading it here costs
+            # no extra I/O and honours the metadata-light scan contract.
+            metadata["codec"] = normalize_codec(getattr(audio.info, "codec", ""))
+
+        # mutagen reports no usable bitrate for ALAC — either 0 or the
+        # *uncompressed* PCM rate (bit depth × sample rate × channels), never
+        # the compressed rate.  Derive the true average from file size and
+        # duration instead, so the databases record a real figure.
+        if metadata.get("codec") in LOSSLESS_CODECS:
+            metadata["bitrate"] = _average_bitrate_kbps(
+                getattr(audio, "filename", None), metadata.get("duration_ms")
+            ) or metadata.get("bitrate")
 
         # Handle different tag formats
         if ext == ".mp3":

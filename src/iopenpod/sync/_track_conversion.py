@@ -17,6 +17,8 @@ from iopenpod.itunesdb_shared.constants import (
 )
 from iopenpod.itunesdb_writer.mhit_writer import TrackInfo
 
+from ._formats import CODEC_AAC, CODEC_ALAC, CODEC_MP3, normalize_codec
+
 # Filetype string → writer filetype code.  Checked in order; first
 # substring match wins.  Falls back to "mp3".
 _FILETYPE_MAP: list[tuple[str, str]] = [
@@ -44,6 +46,48 @@ def ipod_filetype_for_extension(extension: str) -> str:
     return ext or "mp3"
 
 
+# iTunesDB filetype description → codec.  Checked in order; "Lossless" is
+# first so "Apple Lossless audio file" can never fall through to a broader
+# match.  Used only for tracks read back off the iPod, which carry a
+# description string but no probed codec.
+_FILETYPE_DESC_CODEC: list[tuple[str, str]] = [
+    ("Lossless", CODEC_ALAC),
+    ("AAC", CODEC_AAC),
+    ("MPEG", CODEC_MP3),
+    ("MP3", CODEC_MP3),
+]
+
+
+def _codec_from_filetype_description(filetype: str) -> str:
+    """Recover the codec from an iTunesDB filetype description string.
+
+    Returns ``""`` when the description names no codec we recognise, which
+    leaves the writer to fall back to the container filetype.
+    """
+    for needle, codec in _FILETYPE_DESC_CODEC:
+        if needle in filetype:
+            return codec
+    return ""
+
+
+def _inferred_output_codec(filetype: str, source_ext: str, transcode_options) -> str:
+    """Best-effort codec for a transcode output that could not be probed.
+
+    Only reached on the dry-run path, where the output file does not exist
+    yet.  Mirrors the transcoder's own target selection: lossless sources
+    become ALAC unless the user asked for a lossy library.
+    """
+    if filetype == "mp3":
+        return CODEC_MP3
+    if filetype not in {"m4a", "m4b"}:
+        return ""
+    prefer_lossy = bool(getattr(transcode_options, "prefer_lossy", False))
+    is_lossless_source = source_ext.lower().lstrip(".") in ("flac", "wav", "aif", "aiff")
+    if prefer_lossy or not is_lossless_source:
+        return CODEC_AAC
+    return CODEC_ALAC
+
+
 def track_dict_to_info(t: dict) -> TrackInfo:
     """Convert parsed track dict to TrackInfo for writing."""
     filetype = t.get("filetype", "MP3")
@@ -52,12 +96,17 @@ def track_dict_to_info(t: dict) -> TrackInfo:
         if needle in filetype:
             filetype_code = code
             break
+    # Tracks read back from the iPod carry no probed codec, but the iTunesDB
+    # filetype description distinguishes ALAC ("Apple Lossless audio file")
+    # from AAC, so a re-write preserves the original audio_format.
+    codec = t.get("codec") or _codec_from_filetype_description(filetype)
     return TrackInfo(
         title=t.get("Title", "Unknown"),
         location=t.get("Location", ""),
         size=t.get("size", 0),
         length=t.get("length", 0),
         filetype=filetype_code,
+        codec=normalize_codec(codec),
         bitrate=t.get("bitrate", 0),
         sample_rate=t.get("sample_rate_1", 44100),
         vbr=bool(t.get("vbr_flag", 0)),
@@ -299,6 +348,10 @@ def pc_track_to_info(
     postgap = pc_track.postgap or 0
     sample_count = pc_track.sample_count or 0
     gapless_data = pc_track.gapless_data or 0
+    # ── Codec ────────────────────────────────────────────────────
+    # Direct copies keep the source codec.  Transcodes get the codec of the
+    # file actually written, resolved below from the output file.
+    codec = normalize_codec(getattr(pc_track, "codec", ""))
     if was_transcoded:
         # Prefer probing the actual output file — it gives us values at the
         # correct sample rate with no floating-point error, and for files
@@ -309,6 +362,8 @@ def pc_track_to_info(
             probed = probe_gapless_info(ipod_file_path)
             if probed.get("sample_rate"):
                 sample_rate = probed["sample_rate"]
+            if probed.get("codec"):
+                codec = probed["codec"]
             if probed.get("sample_count"):
                 sample_count = probed["sample_count"]
                 pregap = probed.get("pregap", 0)
@@ -317,6 +372,9 @@ def pc_track_to_info(
             # Fallback: the output file isn't available yet (dry-run, etc.).
             # Scale source values to the output sample rate to avoid the
             # early-cutoff bug described in the transcoder fix.
+            codec = _inferred_output_codec(
+                filetype, pc_track.extension, transcode_options
+            )
             src_sr = pc_track.sample_rate or 44100
             if src_sr != sample_rate:
                 ratio = sample_rate / src_sr
@@ -333,6 +391,7 @@ def pc_track_to_info(
     return TrackInfo(
         title=pc_track.title or Path(pc_track.path).stem,
         location=ipod_location,
+        codec=codec,
         size=file_size,
         length=pc_track.duration_ms or 0,
         filetype=filetype,
