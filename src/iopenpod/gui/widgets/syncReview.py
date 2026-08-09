@@ -1710,6 +1710,7 @@ class SyncReviewWidget(QWidget):
 
     sync_requested = pyqtSignal(object)  # Emits selected sync items
     edit_selection_requested = pyqtSignal(object)
+    audiobook_details_requested = pyqtSignal(object)  # Emits one sync item
     skip_backup_signal = pyqtSignal()  # Skip the in-progress pre-sync backup
     give_up_scrobble_signal = pyqtSignal()  # Stop retrying scrobble timeouts
     cancelled = pyqtSignal()
@@ -2165,18 +2166,27 @@ class SyncReviewWidget(QWidget):
         footer_layout.addSpacing(20)
 
         # Cancel and Apply buttons
+        quiet_footer_btn_css = btn_css(
+            bg="transparent",
+            bg_hover=paint_css("control.quiet.hover_fill"),
+            bg_press=paint_css("control.quiet.pressed_fill"),
+            border=f"1px solid {paint_css('border.subtle')}",
+            radius=Metrics.BORDER_RADIUS_SM,
+            padding="8px 18px",
+        )
+
+        # Fills in metadata for a checked audiobook before it is synced.
+        self.audiobook_details_btn = QPushButton("Find Details…", footer)
+        self.audiobook_details_btn.clicked.connect(self._on_audiobook_details)
+        self.audiobook_details_btn.setStyleSheet(quiet_footer_btn_css)
+        self.audiobook_details_btn.setEnabled(False)
+        self.audiobook_details_btn.setToolTip(
+            "Look up title, author, narrator, and cover art for the checked audiobook"
+        )
+
         self.edit_selection_btn = QPushButton("Edit Selection", footer)
         self.edit_selection_btn.clicked.connect(self._edit_selection)
-        self.edit_selection_btn.setStyleSheet(
-            btn_css(
-                bg="transparent",
-                bg_hover=paint_css("control.quiet.hover_fill"),
-                bg_press=paint_css("control.quiet.pressed_fill"),
-                border=f"1px solid {paint_css('border.subtle')}",
-                radius=Metrics.BORDER_RADIUS_SM,
-                padding="8px 18px",
-            )
-        )
+        self.edit_selection_btn.setStyleSheet(quiet_footer_btn_css)
 
         self.cancel_btn = QPushButton("Cancel", footer)
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
@@ -2195,6 +2205,7 @@ class SyncReviewWidget(QWidget):
         self.apply_btn.clicked.connect(self._apply_sync)
         self.apply_btn.setStyleSheet(accent_btn_css())
 
+        footer_layout.addWidget(self.audiobook_details_btn)
         footer_layout.addWidget(self.edit_selection_btn)
         footer_layout.addWidget(self.cancel_btn)
         footer_layout.addWidget(self.apply_btn)
@@ -2397,6 +2408,7 @@ class SyncReviewWidget(QWidget):
         self.expand_all_btn.setVisible(show_plan_btns)
         self.collapse_all_btn.setVisible(show_plan_btns)
         self.selection_label.setVisible(show_plan_btns)
+        self.audiobook_details_btn.setVisible(show_plan_btns)
         self.edit_selection_btn.setVisible(show_plan_btns)
         self.apply_btn.setVisible(show_plan_btns)
 
@@ -3659,6 +3671,7 @@ class SyncReviewWidget(QWidget):
 
     def _do_update_selection_count(self):
         """Actually update the selection summary label."""
+        self.refresh_audiobook_action()
         selected = 0
         total = 0
         bytes_to_add = 0
@@ -3786,6 +3799,29 @@ class SyncReviewWidget(QWidget):
         if self._plan is None:
             return
         self.edit_selection_requested.emit(self.get_selection_state())
+
+    def selected_audiobook_item(self) -> Any | None:
+        """The one checked audiobook, or ``None`` when the action cannot apply.
+
+        Two or more checked audiobooks leave no unambiguous target, so the
+        action is withheld rather than guessing.
+        """
+        from iopenpod.application.audiobook_tagging import is_taggable_audiobook
+
+        audiobooks = [item for item in self._get_selected_items() if is_taggable_audiobook(item)]
+        if len(audiobooks) != 1:
+            return None
+        return audiobooks[0]
+
+    def refresh_audiobook_action(self) -> None:
+        """Enable the details action only when exactly one audiobook is checked."""
+        self.audiobook_details_btn.setEnabled(self.selected_audiobook_item() is not None)
+
+    def _on_audiobook_details(self) -> None:
+        item = self.selected_audiobook_item()
+        if item is None:
+            return
+        self.audiobook_details_requested.emit(item)
 
     def get_selected_photo_plan(self):
         if self._plan is None or self._plan.photo_plan is None:

@@ -33,6 +33,7 @@ GUI_FORBIDDEN_PREFIXES = (
     "iopenpod.sync",
     "iopenpod.device",
     "iopenpod.podcasts",
+    "iopenpod.audiobooks",
     "settings",
     "iopenpod.infrastructure.settings_runtime",
 )

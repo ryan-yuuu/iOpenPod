@@ -98,6 +98,10 @@ files = [
     "src/iopenpod/sync/contracts.py",
     "src/iopenpod/sync/database_commit.py",
     "src/iopenpod/sync/quick_writes.py",
+    # Network clients are excluded, matching podcasts/: they import requests,
+    # whose stubs are not a project dependency.
+    "src/iopenpod/audiobooks/models.py",
+    "src/iopenpod/audiobooks/tagger.py",
     "scripts/check_architecture.py",
     "tests/test_architecture_checks.py",
     "tests/test_backup_jobs.py",

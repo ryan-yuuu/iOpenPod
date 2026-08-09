@@ -17,6 +17,12 @@
       "iopenpod.podcasts.podcast_sync",
       "iopenpod.podcasts.subscription_store"
     ],
+    "src/iopenpod/gui/widgets/audiobookMatchDialog.py": [
+      "iopenpod.audiobooks.audible_search",
+      "iopenpod.audiobooks.audnexus",
+      "iopenpod.audiobooks.models",
+      "iopenpod.audiobooks.network_errors"
+    ],
     "src/iopenpod/gui/widgets/podcastSearchDialog.py": [
       "iopenpod.podcasts.itunes_search",
       "iopenpod.podcasts.network_errors"

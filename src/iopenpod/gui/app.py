@@ -800,6 +800,7 @@ class MainWindow(QMainWindow):
         self.syncReview.cancelled.connect(self._onSyncReviewCancelled)
         self.syncReview.sync_requested.connect(self.executeSyncPlan)
         self.syncReview.edit_selection_requested.connect(self._onSyncReviewEditSelection)
+        self.syncReview.audiobook_details_requested.connect(self._onAudiobookDetailsRequested)
         self.centralStack.addWidget(self.syncReview)  # Index 1
 
         # Settings page
@@ -2618,6 +2619,75 @@ class MainWindow(QMainWindow):
             return
         self.centralStack.setCurrentIndex(4)
         self.selectiveSyncBrowser.load_sync_plan(self._plan, selection_state)
+
+    def _onAudiobookDetailsRequested(self, item: object) -> None:
+        """Look up catalog details for a checked audiobook and tag its PC file."""
+
+        from iopenpod.application.audiobook_tagging import (
+            audiobook_path_for_item,
+            describe_pending_changes,
+            tag_audiobook_file,
+        )
+        from iopenpod.gui.widgets.audiobookMatchDialog import AudiobookMatchDialog
+
+        path = audiobook_path_for_item(item)
+        if path is None:
+            return
+        if not path.is_file():
+            QMessageBox.warning(
+                self,
+                "File Not Found",
+                f"This audiobook is no longer at:\n{path}",
+            )
+            return
+
+        dialog = AudiobookMatchDialog(path, self)
+
+        def _apply(metadata: object) -> None:
+            try:
+                changes = describe_pending_changes(path, metadata)  # type: ignore[arg-type]
+            except Exception as exc:  # noqa: BLE001 - surfaced to the user
+                QMessageBox.warning(self, "Could Not Read File", str(exc))
+                return
+
+            if not changes:
+                QMessageBox.information(
+                    self,
+                    "Already Up To Date",
+                    "This audiobook already has the details from the selected edition.",
+                )
+                dialog.accept()
+                return
+
+            preview = "\n".join(
+                f"  {field}: {old or '—'}  →  {new or '—'}" for field, old, new in changes
+            )
+            confirm = QMessageBox.question(
+                self,
+                "Apply Audiobook Details",
+                f"Write these changes into {path.name}?\n\n{preview}",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Ok,
+            )
+            if confirm != QMessageBox.StandardButton.Ok:
+                return
+
+            result = tag_audiobook_file(path, metadata)  # type: ignore[arg-type]
+            if not result.applied:
+                QMessageBox.warning(self, "Could Not Write Details", result.error)
+                return
+
+            dialog.accept()
+            artwork_note = " Cover art was added." if result.cover_embedded else ""
+            QMessageBox.information(
+                self,
+                "Details Applied",
+                f"Updated {path.name}.{artwork_note}\n\n"
+                "Re-scan or drop the file again to refresh the sync plan.",
+            )
+
+        dialog.metadata_applied.connect(_apply)
+        dialog.exec()
 
     def _onPlanSelectionDone(self, selection_state: object) -> None:
         """Apply alternate plan-editor checks back to the sync review."""
