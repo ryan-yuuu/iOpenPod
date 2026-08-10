@@ -564,7 +564,81 @@ def test_unprobeable_native_audio_reencodes_instead_of_copying_blind(monkeypatch
         target = get_transcode_target("Café.m4a")
 
     assert target == TranscodeTarget.AAC
-    assert "re-encoding instead of copying blind" in caplog.text
+    assert "could not probe" in caplog.text
+
+    # The fallback is a guess, not a finding: the plan must record that, so the
+    # sync review can ask before degrading a possibly-fine file.
+    decision = transcoder_module.resolve_target_decision("Café.m4a")
+    assert decision.target == TranscodeTarget.AAC
+    assert decision.probe_failed is True
+    assert transcoder_module.resolve_transcode_plan("Café.m4a").probe_failed is True
+
+
+def test_probeable_native_audio_is_not_flagged_as_probe_failed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        transcoder_module,
+        "_resolve_lossy_target",
+        lambda options: TranscodeTarget.AAC,
+    )
+    monkeypatch.setattr(
+        transcoder_module,
+        "probe_audio",
+        lambda filepath: AudioProperties(
+            sample_rate=44100, bits_per_sample=0, channels=2,
+            codec_name="aac", profile="LC", probe_ok=True,
+        ),
+    )
+
+    plan = transcoder_module.resolve_transcode_plan("ok.m4a")
+    assert plan.target == TranscodeTarget.COPY
+    assert plan.probe_failed is False
+
+
+def test_aac_source_is_never_reencoded_on_a_bogus_bit_depth(monkeypatch) -> None:
+    """ffprobe may report a decoder's internal precision for compressed codecs.
+
+    Bit depth must not be used to tell ALAC from AAC, or an already-lossy file
+    gets a silent, quality-destroying AAC->AAC round trip.
+    """
+    monkeypatch.setattr(
+        transcoder_module,
+        "_resolve_lossy_target",
+        lambda options: TranscodeTarget.AAC,
+    )
+    for bits in (0, 16, 24, 32):
+        monkeypatch.setattr(
+            transcoder_module,
+            "probe_audio",
+            lambda filepath, _b=bits: AudioProperties(
+                sample_rate=44100, bits_per_sample=_b, channels=2,
+                codec_name="aac", profile="LC", probe_ok=True,
+            ),
+        )
+        target = get_transcode_target(
+            "song.m4a", options=TranscodeOptions(prefer_lossy=True)
+        )
+        assert target == TranscodeTarget.COPY, f"AAC re-encoded at bits={bits}"
+
+
+def test_alac_source_is_detected_by_codec_not_bit_depth(monkeypatch) -> None:
+    monkeypatch.setattr(
+        transcoder_module,
+        "_resolve_lossy_target",
+        lambda options: TranscodeTarget.AAC,
+    )
+    for bits in (0, 16, 24):
+        monkeypatch.setattr(
+            transcoder_module,
+            "probe_audio",
+            lambda filepath, _b=bits: AudioProperties(
+                sample_rate=44100, bits_per_sample=_b, channels=2,
+                codec_name="alac", profile="", probe_ok=True,
+            ),
+        )
+        target = get_transcode_target(
+            "song.m4a", options=TranscodeOptions(prefer_lossy=True)
+        )
+        assert target == TranscodeTarget.AAC, f"ALAC not shrunk at bits={bits}"
 
 
 def test_native_mp3_copies_by_default_and_reencodes_when_forced(monkeypatch) -> None:

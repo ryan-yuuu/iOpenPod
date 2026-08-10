@@ -231,3 +231,44 @@ def count_sync_actions(items: Iterable[Any]) -> SyncActionCounts:
         sync_playcount=counts[ACTION_SYNC_PLAYCOUNT],
         sync_rating=counts[ACTION_SYNC_RATING],
     )
+
+
+def has_probe_failure(item: Any) -> bool:
+    """True when *item*'s transcode target was chosen without a usable probe."""
+    transcode_plan = getattr(item, "transcode_plan", None)
+    if transcode_plan is None:
+        return False
+    return bool(getattr(transcode_plan, "probe_failed", False))
+
+
+def items_with_probe_failure(items: Iterable[Any]) -> list[Any]:
+    """Filter *items* down to those whose transcode decision was made blind.
+
+    ffprobe could not describe these files, so the resolver fell back to
+    re-encoding because copying an unverified stream to the iPod is unsafe.
+    That fallback is a guess: if the file was in fact already compatible, the
+    re-encode is pure quality loss.  Callers surface these so the user
+    decides, rather than the sync degrading them silently.
+    """
+    return [item for item in items if has_probe_failure(item)]
+
+
+def probe_failed_items(plan: Any) -> list[Any]:
+    """Return plan items whose transcode target was chosen without a probe.
+
+    Only ``to_add`` and ``to_update_file`` carry a payload conversion, so no
+    other bucket can be affected.
+    """
+    flagged: list[Any] = []
+    for bucket in ("to_add", "to_update_file"):
+        flagged.extend(items_with_probe_failure(getattr(plan, bucket, None) or ()))
+    return flagged
+
+
+def probe_failure_display_name(item: Any) -> str:
+    """Return a human-readable identifier for a probe-failed *item*."""
+    track = getattr(item, "pc_track", None)
+    path = str(getattr(track, "path", "") or "") if track is not None else ""
+    if path:
+        return path
+    return str(getattr(item, "description", "") or "") or "<unknown>"

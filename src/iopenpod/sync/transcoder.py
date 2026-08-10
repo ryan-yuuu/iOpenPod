@@ -30,7 +30,9 @@ from pathlib import Path
 from typing import BinaryIO, ClassVar, Literal
 
 from ._formats import (
+    CODEC_ALAC,
     IPOD_NATIVE_FORMATS,
+    normalize_codec,
 )
 from ._formats import (
     NON_NATIVE_LOSSLESS as _NON_NATIVE_LOSSLESS_EXTS,
@@ -290,6 +292,15 @@ class TranscodePlan:
     music_lossy_cbr_bitrate: int = 192
     vbr_level: int = 4
     spoken_lossy_cbr_bitrate: int = 64
+    probe_failed: bool = False
+    """True when the target was chosen without a usable ffprobe result.
+
+    A native-looking extension alone does not prove the stream is playable, so
+    the resolver falls back to re-encoding.  That fallback is a guess, and for
+    an already-compatible file it costs real quality, so the plan records it
+    and the sync review asks the user before acting on it.  Never treat this
+    as "needs transcoding" on its own — ``target`` still carries the decision.
+    """
 
     @property
     def is_spoken(self) -> bool:
@@ -434,11 +445,12 @@ def resolve_transcode_plan(
         prefer_lossy = options.prefer_lossy
 
     lossy_policy = _resolve_lossy_policy(options)
-    target = get_transcode_target(
+    decision = resolve_target_decision(
         source_path,
         prefer_lossy=prefer_lossy,
         options=options,
     )
+    target = decision.target
     video_output_muxer = _video_output_muxer(source_path, target)
     normalize_sample_rate = options.normalize_sample_rate
     mono_for_spoken = options.mono_for_spoken
@@ -481,6 +493,7 @@ def resolve_transcode_plan(
         music_lossy_cbr_bitrate=options.music_lossy_cbr_bitrate,
         vbr_level=options.vbr_level,
         spoken_lossy_cbr_bitrate=options.spoken_lossy_cbr_bitrate,
+        probe_failed=decision.probe_failed,
     )
 
 
@@ -1244,6 +1257,26 @@ def _device_supports_cea608_captions() -> bool:
     return _IPOD_CEA608_CAPTION_CODEC in _device_supported_timed_text_codecs()
 
 
+def _is_alac_stream(props: AudioProperties) -> bool:
+    """Return True when the probed stream is ALAC rather than a lossy codec.
+
+    The codec name is authoritative.  ``.m4a`` carries both ALAC and AAC, so
+    the container extension proves nothing, and ffprobe's
+    ``bits_per_raw_sample`` is not a usable discriminator either: it is
+    meaningless for compressed codecs and some AAC streams report the
+    decoder's internal precision (24/32) rather than 0.  Treating that as
+    "lossless" would silently re-encode an AAC file to AAC and lose quality
+    — see the matching note in :meth:`AudioProperties.exceeds_ipod_limits`.
+
+    Bit depth is consulted only when the probe returned no codec name at all,
+    which keeps the previous behaviour for that degenerate case.
+    """
+    codec = normalize_codec(props.codec_name)
+    if codec:
+        return codec == CODEC_ALAC
+    return props.bits_per_sample >= 16
+
+
 def _is_native_lossy_audio(suffix: str, props: AudioProperties) -> bool:
     """Return True for native audio that is already lossy."""
     codec_name = props.codec_name.lower()
@@ -1252,8 +1285,22 @@ def _is_native_lossy_audio(suffix: str, props: AudioProperties) -> bool:
     if suffix == ".aac" or codec_name == "aac":
         return True
     if suffix in {".m4a", ".m4b", ".m4p"}:
-        return codec_name != "alac" and props.bits_per_sample < 16
+        return not _is_alac_stream(props)
     return False
+
+
+@dataclass(frozen=True)
+class TargetDecision:
+    """A resolved :class:`TranscodeTarget` plus how confident the resolver was.
+
+    ``probe_failed`` marks the one case where ``target`` is a fallback rather
+    than a finding: ffprobe could not describe the stream, so re-encoding was
+    chosen because copying blind is unsafe.  Callers that can ask the user
+    should do so instead of acting on the guess.
+    """
+
+    target: TranscodeTarget
+    probe_failed: bool = False
 
 
 def get_transcode_target(
@@ -1264,6 +1311,23 @@ def get_transcode_target(
 ) -> TranscodeTarget:
     """Determine the target format for *filepath*.
 
+    Thin wrapper over :func:`resolve_target_decision` for the many callers
+    that only need the target.  Anything that must distinguish "needs
+    re-encoding" from "could not tell" should use the decision form.
+    """
+    return resolve_target_decision(
+        filepath, prefer_lossy=prefer_lossy, options=options
+    ).target
+
+
+def resolve_target_decision(
+    filepath: str | Path,
+    *,
+    prefer_lossy: bool | None = None,
+    options: TranscodeOptions | None = None,
+) -> TargetDecision:
+    """Determine the target format for *filepath* and how it was reached.
+
     Decision tree:
       1. Video → probe → VIDEO_H264, VIDEO_REMUX, or COPY
       2. Lossless source → ALAC (or AAC if prefer_lossy)
@@ -1273,7 +1337,11 @@ def get_transcode_target(
          (hi-res sample rate / 24-bit / surround)
          or always_encode_lossy wants to re-encode native lossy audio
          or prefer_lossy wants to shrink a native ALAC
+         or the stream could not be probed at all (``probe_failed``)
     """
+    def decided(target: TranscodeTarget) -> TargetDecision:
+        return TargetDecision(target)
+
     suffix = Path(filepath).suffix.lower()
     options = (options or TranscodeOptions()).normalized()
     lossy_target = _resolve_lossy_target(options)
@@ -1287,8 +1355,8 @@ def get_transcode_target(
     # need a conversion regardless of their streams.
     if suffix in _NON_NATIVE_VIDEO_EXTS:
         if suffix == ".mov":
-            return _video_transcode_target(filepath)
-        return TranscodeTarget.VIDEO_H264
+            return decided(_video_transcode_target(filepath))
+        return decided(TranscodeTarget.VIDEO_H264)
 
     if prefer_lossy is None:
         prefer_lossy = options.prefer_lossy
@@ -1297,64 +1365,67 @@ def get_transcode_target(
     if suffix in _NON_NATIVE_LOSSLESS_EXTS:
         if suffix == ".wav":
             if prefer_lossy:
-                return lossy_target
+                return decided(lossy_target)
             if options.convert_wav_to_alac:
                 if not _device_supports_alac():
-                    return lossy_target
-                return TranscodeTarget.ALAC
-            return TranscodeTarget.COPY
+                    return decided(lossy_target)
+                return decided(TranscodeTarget.ALAC)
+            return decided(TranscodeTarget.COPY)
         if prefer_lossy or not _device_supports_alac():
-            return lossy_target
-        return TranscodeTarget.ALAC
+            return decided(lossy_target)
+        return decided(TranscodeTarget.ALAC)
     if suffix in _NON_NATIVE_LOSSY_EXTS:
-        return lossy_target
+        return decided(lossy_target)
 
     # ── Native formats ──────────────────────────────────────────────────
     if suffix in IPOD_NATIVE_FORMATS:
         # Native video — probe codec compatibility
         if suffix in {".mp4", ".m4v"}:
-            return _video_transcode_target(filepath)
+            return decided(_video_transcode_target(filepath))
 
         # Native audio — probe for iPod limits and codec compatibility
         props = probe_audio(filepath)
 
         # Probe failed: do not copy blind. A native-looking extension is not
-        # enough to prove the stream is compatible with the iPod.
+        # enough to prove the stream is compatible with the iPod.  Re-encoding
+        # is the safe fallback, but it is a guess — flag it so the sync review
+        # can ask rather than silently degrading an already-compatible file.
         if not props.probe_ok:
             logger.warning(
-                "TRANSCODE: could not probe %s — re-encoding instead of copying blind",
+                "TRANSCODE: could not probe %s — falling back to re-encode "
+                "(flagged for user confirmation)",
                 Path(filepath).name,
             )
-            return lossy_target
+            return TargetDecision(lossy_target, probe_failed=True)
 
         if options.always_encode_lossy and _is_native_lossy_audio(suffix, props):
-            return lossy_target
+            return decided(lossy_target)
 
         if props.exceeds_ipod_limits():
             if suffix in {".m4a", ".m4b"} and not prefer_lossy and _device_supports_alac():
-                return TranscodeTarget.ALAC
-            return lossy_target
+                return decided(TranscodeTarget.ALAC)
+            return decided(lossy_target)
 
         # HE-AAC v1/v2 — iPod only supports AAC-LC; re-encode to LC
         if props.is_incompatible_aac_profile():
             logger.info("TRANSCODE: %s has incompatible AAC profile %r — re-encoding to AAC-LC",
                         Path(filepath).name, props.profile)
-            return lossy_target
+            return decided(lossy_target)
 
-        # User wants to shrink native ALAC → AAC
-        # (bits_per_sample ≥ 16 distinguishes ALAC from AAC which reports 0)
-        if prefer_lossy and suffix in {".m4a", ".m4b"} and props.bits_per_sample >= 16:
-            return lossy_target
+        # User wants to shrink native ALAC → AAC.  Keyed on the probed codec,
+        # never on bit depth: an AAC source must pass through untouched.
+        if prefer_lossy and suffix in {".m4a", ".m4b"} and _is_alac_stream(props):
+            return decided(lossy_target)
 
         # Device doesn't support ALAC: transcode native ALAC → AAC
-        if (suffix in {".m4a", ".m4b"} and props.bits_per_sample >= 16
+        if (suffix in {".m4a", ".m4b"} and _is_alac_stream(props)
                 and not _device_supports_alac()):
-            return lossy_target
+            return decided(lossy_target)
 
-        return TranscodeTarget.COPY
+        return decided(TranscodeTarget.COPY)
 
     # Unknown extension — AAC is the safest bet
-    return lossy_target
+    return decided(lossy_target)
 
 
 def _video_transcode_target(filepath: str | Path) -> TranscodeTarget:

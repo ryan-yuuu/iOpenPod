@@ -52,7 +52,9 @@ from iopenpod.application.sync_review_model import (
     count_sync_actions,
     group_by_media_type,
     is_sync_action,
+    items_with_probe_failure,
     metadata_change_parts,
+    probe_failure_display_name,
     sync_item_size_delta,
 )
 from iopenpod.infrastructure.media_folders import (
@@ -3865,6 +3867,12 @@ class SyncReviewWidget(QWidget):
             QMessageBox.information(self, "No Selection", "Please select items to sync.")
             return
 
+        # Files iOpenPod could not analyse would be re-encoded on a guess,
+        # which is permanent quality loss when the file was in fact playable.
+        # The confirmation dialog below surfaces them and lets the user choose;
+        # nothing is decided silently.
+        probe_failures = items_with_probe_failure(selected_items)
+
         # Confirm
         action_counts = count_sync_actions(selected_items)
         add_count = action_counts.add_to_ipod
@@ -3965,6 +3973,46 @@ class SyncReviewWidget(QWidget):
         confirm_body.setStyleSheet(f"color:{paint_css('text.secondary')}; background:transparent;")
         cl.addWidget(confirm_body)
 
+        # ── Files that could not be analysed ────────────────────────
+        skip_probe_failures: QCheckBox | None = None
+        if probe_failures:
+            shown = [
+                os.path.basename(probe_failure_display_name(item))
+                for item in probe_failures[:8]
+            ]
+            listing = "\n".join(f"    • {name}" for name in shown)
+            if len(probe_failures) > len(shown):
+                listing += f"\n    …and {len(probe_failures) - len(shown)} more"
+
+            noun = "file" if len(probe_failures) == 1 else "files"
+            warn = QLabel(
+                f"⚠  {len(probe_failures)} selected {noun} could not be analysed.\n\n"
+                "iOpenPod could not read the audio stream, so it cannot confirm "
+                "the iPod can play them. Re-encoding guarantees playback but "
+                "permanently reduces quality — and buys nothing if the file was "
+                "already compatible.\n\n"
+                f"{listing}",
+                confirm,
+            )
+            warn.setWordWrap(True)
+            warn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
+            warn.setStyleSheet(
+                f"color:{paint_css('status.warning.text')}; background:transparent;"
+            )
+            cl.addWidget(warn)
+
+            skip_probe_failures = QCheckBox(
+                f"Skip {'this file' if len(probe_failures) == 1 else 'these files'} "
+                "instead of re-encoding (recommended)",
+                confirm,
+            )
+            skip_probe_failures.setChecked(True)
+            skip_probe_failures.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
+            skip_probe_failures.setStyleSheet(
+                f"color:{paint_css('text.primary')}; background:transparent;"
+            )
+            cl.addWidget(skip_probe_failures)
+
         cl.addSpacing(8)
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -3981,6 +4029,25 @@ class SyncReviewWidget(QWidget):
 
         if confirm.exec() != QDialog.DialogCode.Accepted:
             return
+
+        # Honour the unanalysable-files choice before anything is written.
+        if probe_failures and skip_probe_failures is not None and skip_probe_failures.isChecked():
+            skipped = {id(item) for item in probe_failures}
+            selected_items = [item for item in selected_items if id(item) not in skipped]
+            logger.info(
+                "SYNC: skipping %d file(s) that could not be probed (user choice)",
+                len(skipped),
+            )
+            if not selected_items and not playlists_selected and not has_integrity_fixes \
+                    and not has_rockbox_metadata \
+                    and not (selected_photo_plan and selected_photo_plan.has_changes):
+                QMessageBox.information(
+                    self,
+                    "Nothing Left to Sync",
+                    "The only selected items were files that could not be analysed, "
+                    "and they were skipped.",
+                )
+                return
 
         # Decide backup strategy based on setting
         settings = self._settings_service.get_effective_settings()
