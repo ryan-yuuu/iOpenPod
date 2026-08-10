@@ -384,7 +384,6 @@ class _PodcastCardMouseButton(QPushButton):
 class _PodcastEpisodeCard(QFrame):
     clicked = pyqtSignal(int, object)
     more_requested = pyqtSignal(int)
-    add_requested = pyqtSignal(int)
     remove_requested = pyqtSignal(int)
     context_requested = pyqtSignal(int, QPoint)
 
@@ -478,36 +477,8 @@ class _PodcastEpisodeCard(QFrame):
         self._action_row.setObjectName("podcastEpisodeActionRow")
         self._action_row.setFixedHeight(_EPISODE_ACTION_ROW_HEIGHT)
 
-        self._add_btn = _PodcastCardMouseButton("Add to iPod", self._action_row)
-        self._add_btn.setObjectName("podcastEpisodeAddButton")
-        self._add_btn.setToolTip("Add this episode to iPod")
-        self._add_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold))
-        self._add_btn.setStyleSheet(
-            btn_css(
-                bg=paint_css("control.primary.fill"),
-                bg_hover=paint_css("control.primary.hover_fill"),
-                bg_press=paint_css("control.primary.pressed_fill"),
-                fg=paint_css("control.primary.text"),
-                border=f"1px solid {paint_css('control.primary.fill')}",
-                padding="3px 9px",
-                radius=Metrics.BORDER_RADIUS_SM,
-            )
-        )
-        add_icon = glyph_icon("plus", 13, paint_css("control.primary.text"))
-        if add_icon:
-            self._add_btn.setIcon(add_icon)
-            self._add_btn.setIconSize(QSize(13, 13))
-        add_metrics = QFontMetrics(self._add_btn.font())
-        self._add_btn_full_text = "Add to iPod"
-        self._add_btn_full_width = add_metrics.horizontalAdvance(
-            self._add_btn_full_text
-        ) + 34
-        self._add_btn.setFixedSize(
-            self._add_btn_full_width,
-            _EPISODE_ACTION_ROW_HEIGHT,
-        )
-        self._add_btn.clicked.connect(lambda: self.add_requested.emit(self._row_index))
-
+        # Adding is driven by row selection plus the batch confirm bar, so the
+        # card carries no add button of its own.
         self._remove_btn = _PodcastCardMouseButton(
             "Remove from iPod",
             self._action_row,
@@ -574,7 +545,6 @@ class _PodcastEpisodeCard(QFrame):
             self._meta_label,
             self._description_label,
             self._action_row,
-            self._add_btn,
             self._remove_btn,
             self._more_btn,
         ):
@@ -627,7 +597,6 @@ class _PodcastEpisodeCard(QFrame):
 
         self._more_btn.setText("Show less" if expanded else "More")
         self._more_btn.setVisible(show_more)
-        self._add_btn.setVisible(bool(row.get("_can_add_to_ipod")))
         self._remove_btn.setVisible(bool(row.get("_can_remove_from_ipod")))
         self._update_card_layout()
         self._apply_style()
@@ -753,7 +722,6 @@ class _PodcastEpisodeCard(QFrame):
 
         action_x = 0
         for button, full_text, full_width in (
-            (self._add_btn, self._add_btn_full_text, self._add_btn_full_width),
             (
                 self._remove_btn,
                 self._remove_btn_full_text,
@@ -846,7 +814,7 @@ class _PodcastEpisodeCard(QFrame):
 
         if a1.type() == QEvent.Type.MouseButtonPress:
             mouse_event = cast(QMouseEvent, a1)
-            if a0 in (self._add_btn, self._remove_btn, self._more_btn):
+            if a0 in (self._remove_btn, self._more_btn):
                 return super().eventFilter(a0, a1)
             if mouse_event.button() == Qt.MouseButton.LeftButton:
                 self.clicked.emit(self._row_index, mouse_event.modifiers())
@@ -963,6 +931,17 @@ class _PodcastEpisodeList(QFrame):
         self._rebuild_heights()
         self._reset_scroll_position()
         self.schedule_viewport_refresh(force=True)
+        self._notify_selection_changed()
+
+    def _notify_selection_changed(self) -> None:
+        """Tell the owner the selection moved, if it cares.
+
+        Matched to how card action handlers are resolved: the list stays
+        usable with owners that do not implement the hook.
+        """
+        handler = getattr(self._owner, "_refresh_episode_selection_bar", None)
+        if callable(handler):
+            handler()
 
     def selected_rows(self) -> list[int]:
         return sorted(row for row in self._selected_rows if row < len(self._tracks))
@@ -973,6 +952,7 @@ class _PodcastEpisodeList(QFrame):
         old_rows = set(self._selected_rows)
         self._selected_rows.clear()
         self._update_selection_for_rows(old_rows)
+        self._notify_selection_changed()
 
     def select_row(self, row: int) -> None:
         if not (0 <= row < len(self._tracks)):
@@ -980,6 +960,7 @@ class _PodcastEpisodeList(QFrame):
         old_rows = set(self._selected_rows)
         self._selected_rows = {row}
         self._update_selection_for_rows(old_rows | {row})
+        self._notify_selection_changed()
 
     def row_at_viewport_y(self, y: int) -> int:
         bar = self.table.verticalScrollBar()
@@ -1152,9 +1133,6 @@ class _PodcastEpisodeList(QFrame):
         widget = _PodcastEpisodeCard(self._content)
         widget.clicked.connect(self._on_card_clicked)
         widget.more_requested.connect(self._toggle_expanded)
-        add_handler = getattr(self._owner, "_on_episode_card_add_to_ipod", None)
-        if callable(add_handler):
-            widget.add_requested.connect(add_handler)
         remove_handler = getattr(self._owner, "_on_episode_card_remove_from_ipod", None)
         if callable(remove_handler):
             widget.remove_requested.connect(remove_handler)
@@ -1244,23 +1222,20 @@ class _PodcastEpisodeList(QFrame):
         if not (0 <= row_index < len(self._tracks)):
             return
         old_rows = set(self._selected_rows)
-        ctrl = bool(
-            modifiers
-            & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)
-        )
         shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
         if shift and self._selected_rows:
             anchor = min(self._selected_rows)
             lo, hi = sorted((anchor, row_index))
-            self._selected_rows = set(range(lo, hi + 1))
-        elif ctrl:
+            self._selected_rows |= set(range(lo, hi + 1))
+        else:
+            # Plain click toggles, so batches can be built without modifiers.
+            # Ctrl/Cmd behaves the same rather than being a second way in.
             if row_index in self._selected_rows:
                 self._selected_rows.remove(row_index)
             else:
                 self._selected_rows.add(row_index)
-        else:
-            self._selected_rows = {row_index}
         self._update_selection_for_rows(old_rows | self._selected_rows)
+        self._notify_selection_changed()
 
     def _on_card_context_menu(self, row_index: int, pos: QPoint) -> None:
         widget = self._visible_widgets.get(row_index)
@@ -1861,6 +1836,47 @@ class PodcastBrowser(QFrame):
         self._episode_stack.addWidget(self._episode_state)  # index 1: visual state
         self._episode_stack.setCurrentIndex(0)
         layout.addWidget(self._episode_stack, stretch=1)
+
+        # ── Batch selection bar (hidden until rows are selected) ─────────
+        self._selection_bar = QFrame()
+        self._selection_bar.setObjectName("podcastSelectionBar")
+        self._selection_bar.setFixedHeight(44)
+        self._selection_bar.setStyleSheet(
+            f"QFrame#podcastSelectionBar {{"
+            f" background: {paint_css('surface.raised')};"
+            f" border-top: 1px solid {paint_css('border.subtle')};"
+            f" }}"
+        )
+        selection_lay = QHBoxLayout(self._selection_bar)
+        selection_lay.setContentsMargins(12, 0, 12, 0)
+        selection_lay.setSpacing(8)
+
+        self._selection_count_label = make_label(
+            "",
+            size=Metrics.FONT_SM,
+            weight=QFont.Weight.DemiBold,
+        )
+        selection_lay.addWidget(self._selection_count_label)
+        selection_lay.addStretch()
+
+        self._selection_clear_btn = QPushButton("Clear")
+        self._selection_clear_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._selection_clear_btn.setStyleSheet(btn_css(radius=Metrics.BORDER_RADIUS_SM))
+        self._selection_clear_btn.setFixedHeight(28)
+        self._selection_clear_btn.clicked.connect(self._episode_list.clear_selection)
+        selection_lay.addWidget(self._selection_clear_btn)
+
+        self._selection_apply_btn = QPushButton("Add to iPod")
+        self._selection_apply_btn.setFont(
+            QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold)
+        )
+        self._selection_apply_btn.setStyleSheet(accent_btn_css("sm"))
+        self._selection_apply_btn.setFixedHeight(28)
+        self._selection_apply_btn.clicked.connect(self._on_apply_episode_selection)
+        selection_lay.addWidget(self._selection_apply_btn)
+
+        self._selection_bar.hide()
+        layout.addWidget(self._selection_bar)
 
         # ── Download progress bar (hidden by default) ────────────────────
         self._progress_bar = QProgressBar()
@@ -2866,11 +2882,27 @@ class PodcastBrowser(QFrame):
             return
         self._add_to_ipod_refs(selected)
 
-    def _on_episode_card_add_to_ipod(self, row_index: int) -> None:
-        ref = self._episode_ref_at_row(row_index)
-        if ref is None:
+    def _refresh_episode_selection_bar(self) -> None:
+        """Show the batch bar, and its counts, only while rows are selected."""
+        bar = getattr(self, "_selection_bar", None)
+        if bar is None:
+            return  # Called during construction, before the bar exists.
+
+        count = len(self._episode_list.selected_rows())
+        if not count:
+            bar.hide()
             return
-        self._add_to_ipod_refs([ref])
+
+        noun = "episode" if count == 1 else "episodes"
+        self._selection_count_label.setText(f"{count} {noun} selected")
+        self._selection_apply_btn.setText(f"Add {count} to iPod")
+        bar.show()
+
+    def _on_apply_episode_selection(self) -> None:
+        refs = self._get_selected_episode_refs()
+        if not refs:
+            return
+        self._add_to_ipod_refs(refs)
 
     def _add_to_ipod_refs(self, episode_refs: list) -> None:
         caps = self._device_sessions.current_session().capabilities

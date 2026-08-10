@@ -52,7 +52,6 @@ def test_episode_card_uses_resolved_episode_and_action_paints(qtbot) -> None:
     qtbot.addWidget(card)
 
     assert paint_css("podcast.episode.fill") in card.styleSheet()
-    assert paint_css("control.primary.fill") in card._add_btn.styleSheet()
     assert paint_css("status.danger.subtle_fill") in card._remove_btn.styleSheet()
 
 
@@ -322,14 +321,13 @@ def test_episode_card_artwork_only_shows_for_combined_feed(qtbot) -> None:
 
 
 def test_episode_card_shows_and_emits_ipod_action_buttons(qtbot) -> None:
+    """Only Remove lives on the card; adding is driven by row selection."""
     card = _PodcastEpisodeCard()
     qtbot.addWidget(card)
     card.resize(900, _EPISODE_ARTWORK_COLLAPSED_HEIGHT - _EPISODE_ROW_GAP)
     card.show()
 
-    add_seen: list[int] = []
     remove_seen: list[int] = []
-    card.add_requested.connect(add_seen.append)
     card.remove_requested.connect(remove_seen.append)
 
     row = {
@@ -353,16 +351,10 @@ def test_episode_card_shows_and_emits_ipod_action_buttons(qtbot) -> None:
         artwork_pixmap=QPixmap(4, 4),
     )
 
-    add_button = card.findChild(QPushButton, "podcastEpisodeAddButton")
+    assert card.findChild(QPushButton, "podcastEpisodeAddButton") is None
     remove_button = card.findChild(QPushButton, "podcastEpisodeRemoveButton")
-    assert add_button is not None
     assert remove_button is not None
-    assert add_button.isVisibleTo(card)
     assert not remove_button.isVisibleTo(card)
-
-    qtbot.mouseClick(add_button, Qt.MouseButton.LeftButton)
-
-    assert add_seen == [7]
     assert remove_seen == []
 
     row["_can_add_to_ipod"] = False
@@ -380,12 +372,10 @@ def test_episode_card_shows_and_emits_ipod_action_buttons(qtbot) -> None:
         artwork_pixmap=QPixmap(4, 4),
     )
 
-    assert not add_button.isVisibleTo(card)
     assert remove_button.isVisibleTo(card)
 
     qtbot.mouseClick(remove_button, Qt.MouseButton.LeftButton)
 
-    assert add_seen == [7]
     assert remove_seen == [8]
 
 
