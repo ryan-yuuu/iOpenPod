@@ -290,6 +290,10 @@ class AppSettings:
     rockbox_metadata_support: bool = False
     max_backups: int = 0
 
+    # Silent startup update check.  The manual check in Settings stays
+    # available regardless, so opting out never blocks a deliberate check.
+    check_updates_on_launch: bool = True
+
     def __post_init__(self) -> None:
         apply_backup_before_sync_mode(self)
         self.player_position = normalize_player_position(self.player_position)

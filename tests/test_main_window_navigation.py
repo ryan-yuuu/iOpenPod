@@ -116,16 +116,21 @@ class _FakeStack:
 
 def test_startup_update_result_routes_to_current_settings_page() -> None:
     original_results: list[object] = []
-    current_results: list[object] = []
+    current_results: list[tuple[object, bool]] = []
+
+    def _current(result: object, *, from_startup: bool = False) -> None:
+        current_results.append((result, from_startup))
+
     window = SimpleNamespace(settingsPage=SimpleNamespace(_handle_update_result=original_results.append))
     handler = MainWindow._handle_startup_update_result.__get__(window)
-    window.settingsPage = SimpleNamespace(_handle_update_result=current_results.append)
+    window.settingsPage = SimpleNamespace(_handle_update_result=_current)
     result = object()
 
     handler(result)
 
     assert original_results == []
-    assert current_results == [result]
+    # Flagged as a startup result so the popup offers the opt-out button.
+    assert current_results == [(result, True)]
 
 
 class _FakeSignal:

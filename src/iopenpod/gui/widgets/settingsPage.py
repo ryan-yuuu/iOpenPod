@@ -1474,6 +1474,14 @@ class SettingsPage(QWidget):
         )
         self.version_row.clicked.connect(self._check_for_updates)
 
+        self.check_updates_on_launch = ToggleRow(
+            "Check for Updates on Launch",
+            "Quietly look for a newer release shortly after iOpenPod starts, and "
+            "show a notice when one is available. Turning this off does not "
+            "affect the Check button above.",
+            checked=True,
+        )
+
         self.bug_report_row = ActionRow(
             "Report a Bug",
             "Open the GitHub issue tracker to report problems or request features.",
@@ -1520,6 +1528,7 @@ class SettingsPage(QWidget):
         )
         self._about_card = _SettingsCard(
             self.version_row,
+            self.check_updates_on_launch,
             self.bug_report_row,
             self.kofi_row,
         )
@@ -2216,6 +2225,9 @@ class SettingsPage(QWidget):
         self.show_art.value = s.show_art_in_tracklist
         self.rounded_artwork.value = s.rounded_artwork
         self.sharpen_artwork.value = s.sharpen_artwork
+        self.check_updates_on_launch.value = bool(
+            getattr(s, "check_updates_on_launch", True)
+        )
 
         grid_item_size_text = _GRID_ITEM_SIZE_DISPLAY.get(
             normalize_grid_item_size(getattr(s, "grid_item_size", GRID_ITEM_SIZE_LARGE)),
@@ -2437,6 +2449,7 @@ class SettingsPage(QWidget):
             self.show_art.changed.connect(self._save)
             self.rounded_artwork.changed.connect(self._save)
             self.sharpen_artwork.changed.connect(self._save)
+            self.check_updates_on_launch.changed.connect(self._save)
             self.accent_color.changed.connect(self._save)
             self.theme_mode_combo.changed.connect(self._save)
             self.light_theme_combo.changed.connect(self._save)
@@ -2661,6 +2674,7 @@ class SettingsPage(QWidget):
         if include_global_only:
             s.rounded_artwork = self.rounded_artwork.value
             s.sharpen_artwork = self.sharpen_artwork.value
+            s.check_updates_on_launch = self.check_updates_on_launch.value
             s.grid_item_size = _GRID_ITEM_SIZE_BY_TEXT.get(self.grid_item_size.value, GRID_ITEM_SIZE_LARGE)
             # Theme preferences
             s.theme_mode = {
@@ -2977,7 +2991,24 @@ class SettingsPage(QWidget):
         self._update_checker.result_ready.connect(_on_result)
         self._update_checker.start()
 
-    def _handle_update_result(self, result):
+    def set_check_updates_on_launch(self, enabled: bool) -> None:
+        """Persist the launch-check preference and reflect it in the toggle.
+
+        This always writes global settings: the About card is global-only, so
+        the preference must not depend on which scope is being edited.
+        """
+        was_loading = self._loading_settings
+        self._loading_settings = True
+        try:
+            self.check_updates_on_launch.value = enabled
+        finally:
+            self._loading_settings = was_loading
+
+        settings = self._settings_service.get_global_settings()
+        settings.check_updates_on_launch = enabled
+        self._settings_service.save_global_settings(settings)
+
+    def _handle_update_result(self, result, *, from_startup: bool = False):
         """Show update-available UI and optionally download/install."""
         from PyQt6.QtWidgets import QDialog, QMessageBox, QProgressDialog
 
@@ -2989,8 +3020,13 @@ class SettingsPage(QWidget):
         )
         from iopenpod.gui.widgets.updateDialog import UpdateAvailableDialog
 
-        dialog = UpdateAvailableDialog(result, self)
+        dialog = UpdateAvailableDialog(result, self, allow_opt_out=from_startup)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        # Opting out accepts the dialog, so this runs before the install check.
+        if dialog.selected_action == "never":
+            self.set_check_updates_on_launch(False)
             return
 
         if dialog.selected_action != "install":

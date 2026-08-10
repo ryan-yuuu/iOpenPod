@@ -101,6 +101,7 @@ class SettingsSnapshot:
     normalize_tags_after_sync: bool
     rockbox_metadata_support: bool
     max_backups: int
+    check_updates_on_launch: bool
 
     @classmethod
     def from_settings(cls, settings: AppSettings) -> SettingsSnapshot:

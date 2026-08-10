@@ -507,6 +507,7 @@ class MainWindow(QMainWindow):
         self._startup_updates = StartupUpdateController(
             self._create_update_checker,
             self,
+            is_enabled=self._startup_update_check_enabled,
         )
         self._library_view_device_path: str | None = None
 
@@ -616,11 +617,17 @@ class MainWindow(QMainWindow):
         self._startup_updates.update_available.connect(self._handle_startup_update_result)
         self._startup_updates.start_later(2000)
 
+    def _startup_update_check_enabled(self) -> bool:
+        """Whether the user still wants the silent check at launch."""
+
+        settings = self.settings_service.get_effective_settings()
+        return bool(getattr(settings, "check_updates_on_launch", True))
+
     @pyqtSlot(object)
     def _handle_startup_update_result(self, result: object) -> None:
         """Route startup results to the current, potentially rebuilt settings page."""
 
-        self.settingsPage._handle_update_result(result)
+        self.settingsPage._handle_update_result(result, from_startup=True)
 
     @staticmethod
     def _create_update_checker(parent):

@@ -141,10 +141,14 @@ class UpdateAvailableDialog(QDialog):
         *,
         method: InstallMethod | None = None,
         platform: str = sys.platform,
+        allow_opt_out: bool = False,
     ):
         super().__init__(parent)
         self._update_result = result
         self.selected_action = "dismiss"
+        # Only the silent startup popup offers the opt-out.  A manual check
+        # is a deliberate request, so "stop reminding me" has no place in it.
+        self._allow_opt_out = allow_opt_out
         self._method = detect_install_method(platform=platform) if method is None else method
         self._guidance = build_update_guidance(
             result,
@@ -320,6 +324,19 @@ class UpdateAvailableDialog(QDialog):
         release_btn.clicked.connect(self._open_release_page)
         layout.addWidget(release_btn)
 
+        if self._allow_opt_out:
+            # Kept in the low-emphasis left cluster, well away from Install.
+            self.opt_out_btn = QPushButton("Don't Remind Me Again")
+            self.opt_out_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+            self.opt_out_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.opt_out_btn.setStyleSheet(button_css("quiet", "sm"))
+            self.opt_out_btn.setToolTip(
+                "Stop checking for updates at launch. You can still check "
+                "any time from Settings > General > About."
+            )
+            self.opt_out_btn.clicked.connect(self._select_opt_out)
+            layout.addWidget(self.opt_out_btn)
+
         layout.addStretch(1)
 
         later_btn = QPushButton("Later")
@@ -353,6 +370,10 @@ class UpdateAvailableDialog(QDialog):
 
     def _select_install(self) -> None:
         self.selected_action = "install"
+        self.accept()
+
+    def _select_opt_out(self) -> None:
+        self.selected_action = "never"
         self.accept()
 
 

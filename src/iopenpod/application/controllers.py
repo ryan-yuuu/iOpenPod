@@ -129,9 +129,11 @@ class StartupUpdateController(QObject):
         self,
         checker_factory: Callable[[QObject | None], Any],
         parent: QObject | None = None,
+        is_enabled: Callable[[], bool] | None = None,
     ):
         super().__init__(parent)
         self._checker_factory = checker_factory
+        self._is_enabled = is_enabled
         self._checker: Any | None = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -142,6 +144,10 @@ class StartupUpdateController(QObject):
 
     def start(self) -> None:
         if self._checker is not None:
+            return
+        # Read the preference when the check actually fires, not when it was
+        # scheduled, so opting out mid-session takes effect immediately.
+        if self._is_enabled is not None and not self._is_enabled():
             return
 
         checker = self._checker_factory(self)
