@@ -2627,30 +2627,111 @@ class MainWindow(QMainWindow):
         self.centralStack.setCurrentIndex(4)
         self.selectiveSyncBrowser.load_sync_plan(self._plan, selection_state)
 
-    def _onAudiobookDetailsRequested(self, item: object) -> None:
-        """Look up catalog details for a checked audiobook and tag its PC file."""
+    def _onAudiobookDetailsRequested(self, items: object) -> None:
+        """Look up catalog details for the checked audiobooks and tag their files.
+
+        Several are worked through one at a time, each in its own match dialog:
+        the catalog is searched per title, so there is nothing to batch at the
+        network layer — only the prompting.
+        """
 
         from iopenpod.application.audiobook_tagging import (
+            AudiobookRunSummary,
             audiobook_path_for_item,
+            summarize_tagging_run,
+        )
+
+        targets = list(items) if isinstance(items, list | tuple) else [items]
+
+        paths: list[Path] = []
+        problems: list[str] = []
+        for item in targets:
+            path = audiobook_path_for_item(item)
+            if path is None:
+                continue
+            if not path.is_file():
+                problems.append(f"{path.name}: no longer at {path.parent}")
+                continue
+            paths.append(path)
+
+        if not paths:
+            if problems:
+                QMessageBox.warning(self, "File Not Found", "\n".join(problems))
+            return
+
+        total = len(paths)
+        # One book and nothing already amiss keeps the original per-file
+        # prompts; anything else reports once at the end, so a run never
+        # announces the same outcome twice.
+        solo = total == 1 and not problems
+
+        applied: list[str] = []
+        unchanged: list[str] = []
+        skipped: list[str] = []
+        stopped_at: int | None = None
+
+        for index, path in enumerate(paths, start=1):
+            position = (index, total) if total > 1 else None
+            outcome, detail = self._runAudiobookMatch(path, position, announce=solo)
+            if outcome == "applied":
+                applied.append(path.name)
+            elif outcome == "unchanged":
+                unchanged.append(path.name)
+            elif outcome == "skipped":
+                skipped.append(path.name)
+            elif outcome == "failed":
+                problems.append(f"{path.name}: {detail}")
+            elif outcome == "cancelled":
+                # Cancel abandons the run; Skip is the way past a single book.
+                stopped_at = index
+                break
+
+        if solo:
+            return
+
+        summary = AudiobookRunSummary(
+            total=total,
+            applied=tuple(applied),
+            unchanged=tuple(unchanged),
+            skipped=tuple(skipped),
+            problems=tuple(problems),
+            stopped_at=stopped_at,
+        )
+        body = summarize_tagging_run(summary)
+        if not body:
+            return
+        if summary.has_problems:
+            QMessageBox.warning(self, "Audiobook Details", body)
+        else:
+            QMessageBox.information(self, "Audiobook Details", body)
+
+    def _runAudiobookMatch(
+        self,
+        path: Path,
+        position: tuple[int, int] | None,
+        *,
+        announce: bool,
+    ) -> tuple[str, str]:
+        """Match and tag one audiobook file.
+
+        Returns ``(outcome, detail)`` where outcome is one of ``applied``,
+        ``unchanged``, ``skipped``, ``cancelled`` or ``failed``. ``announce``
+        shows the per-file confirmation; a run over several books reports once
+        at the end rather than interrupting after each one.
+        """
+
+        from iopenpod.application.audiobook_tagging import (
             describe_pending_changes,
             tag_audiobook_file,
         )
         from iopenpod.gui.widgets.audiobookMatchDialog import AudiobookMatchDialog
 
-        path = audiobook_path_for_item(item)
-        if path is None:
-            return
-        if not path.is_file():
-            QMessageBox.warning(
-                self,
-                "File Not Found",
-                f"This audiobook is no longer at:\n{path}",
-            )
-            return
-
-        dialog = AudiobookMatchDialog(path, self)
+        dialog = AudiobookMatchDialog(path, self, batch_position=position)
+        outcome = "cancelled"
+        detail = ""
 
         def _apply(metadata: object) -> None:
+            nonlocal outcome, detail
             try:
                 changes = describe_pending_changes(path, metadata)  # type: ignore[arg-type]
             except Exception as exc:  # noqa: BLE001 - surfaced to the user
@@ -2658,11 +2739,13 @@ class MainWindow(QMainWindow):
                 return
 
             if not changes:
-                QMessageBox.information(
-                    self,
-                    "Already Up To Date",
-                    "This audiobook already has the details from the selected edition.",
-                )
+                outcome, detail = "unchanged", ""
+                if announce:
+                    QMessageBox.information(
+                        self,
+                        "Already Up To Date",
+                        "This audiobook already has the details from the selected edition.",
+                    )
                 dialog.accept()
                 return
 
@@ -2677,24 +2760,36 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Ok,
             )
             if confirm != QMessageBox.StandardButton.Ok:
+                # Declining the write leaves the dialog open to pick again.
                 return
 
             result = tag_audiobook_file(path, metadata)  # type: ignore[arg-type]
             if not result.applied:
-                QMessageBox.warning(self, "Could Not Write Details", result.error)
+                # Closing on failure keeps the outcome unambiguous: a later
+                # cancel cannot then be mistaken for this failure. Re-picking
+                # an edition would not fix a write error anyway.
+                outcome, detail = "failed", result.error
+                dialog.accept()
+                if announce:
+                    QMessageBox.warning(self, "Could Not Write Details", result.error)
                 return
 
+            outcome, detail = "applied", ""
             dialog.accept()
-            artwork_note = " Cover art was added." if result.cover_embedded else ""
-            QMessageBox.information(
-                self,
-                "Details Applied",
-                f"Updated {path.name}.{artwork_note}\n\n"
-                "Re-scan or drop the file again to refresh the sync plan.",
-            )
+            if announce:
+                artwork_note = " Cover art was added." if result.cover_embedded else ""
+                QMessageBox.information(
+                    self,
+                    "Details Applied",
+                    f"Updated {path.name}.{artwork_note}\n\n"
+                    "Re-scan or drop the file again to refresh the sync plan.",
+                )
 
         dialog.metadata_applied.connect(_apply)
-        dialog.exec()
+        code = dialog.exec()
+        if code == AudiobookMatchDialog.Skipped:
+            return "skipped", ""
+        return outcome, detail
 
     def _onPlanSelectionDone(self, selection_state: object) -> None:
         """Apply alternate plan-editor checks back to the sync review."""

@@ -190,3 +190,66 @@ def test_tagging_result_carries_the_path(tmp_path: Path) -> None:
 @pytest.mark.parametrize("suffix", [".m4b", ".M4B", ".m4a", ".mp4"])
 def test_mp4_family_extensions_are_accepted(tmp_path: Path, suffix: str) -> None:
     assert is_taggable_audiobook(_item(tmp_path, f"book{suffix}"))
+
+
+# ── Run summary ─────────────────────────────────────────────────────────────
+
+
+def _summary(**kwargs):
+    from iopenpod.application.audiobook_tagging import AudiobookRunSummary
+
+    kwargs.setdefault("total", 1)
+    return AudiobookRunSummary(**kwargs)
+
+
+def _text(**kwargs) -> str:
+    from iopenpod.application.audiobook_tagging import summarize_tagging_run
+
+    return summarize_tagging_run(_summary(**kwargs))
+
+
+def test_summary_is_empty_when_nothing_happened() -> None:
+    # Nothing to say means no dialog at all.
+    assert _text() == ""
+
+
+def test_summary_counts_and_names_updated_books() -> None:
+    text = _text(total=2, applied=("a.m4b", "b.m4b"))
+
+    assert "Updated 2: a.m4b, b.m4b" in text
+
+
+def test_summary_mentions_rescanning_only_when_something_changed() -> None:
+    assert "Re-scan" in _text(total=1, applied=("a.m4b",))
+    assert "Re-scan" not in _text(total=1, skipped=("a.m4b",))
+
+
+def test_summary_reports_each_outcome_separately() -> None:
+    text = _text(total=3, applied=("a.m4b",), unchanged=("b.m4b",), skipped=("c.m4b",))
+
+    assert "Updated 1: a.m4b" in text
+    assert "Already up to date 1: b.m4b" in text
+    assert "Skipped 1: c.m4b" in text
+
+
+def test_stopping_early_counts_the_books_never_reached() -> None:
+    # Cancelled on the second of five: that book and the three after it.
+    text = _text(total=5, applied=("a.m4b",), stopped_at=2)
+
+    assert "4 left untouched" in text
+
+
+def test_finishing_the_run_reports_no_untouched_books() -> None:
+    assert _summary(total=3, stopped_at=None).untouched == 0
+
+
+def test_problems_are_listed_and_flagged() -> None:
+    summary = _summary(total=1, problems=("a.m4b: permission denied",))
+
+    assert summary.has_problems
+    assert "a.m4b: permission denied" in _text(total=1, problems=("a.m4b: permission denied",))
+
+
+def test_problems_alone_still_produce_a_report() -> None:
+    # A missing file must not vanish just because nothing else happened.
+    assert _text(total=1, problems=("gone.m4b: no longer at /x",)).startswith("Problems:")

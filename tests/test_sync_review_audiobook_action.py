@@ -92,7 +92,7 @@ def test_an_audiobook_alongside_music_still_enables(qtbot, tmp_path: Path) -> No
     assert widget.audiobook_details_btn.isEnabled()
 
 
-def test_two_audiobooks_disable_the_button(qtbot, tmp_path: Path) -> None:
+def test_two_audiobooks_also_enable_the_button(qtbot, tmp_path: Path) -> None:
     widget = _review(qtbot)
     _with_selection(
         widget,
@@ -101,9 +101,10 @@ def test_two_audiobooks_disable_the_button(qtbot, tmp_path: Path) -> None:
 
     widget.refresh_audiobook_action()
 
-    # Ambiguous target — the user must narrow the selection.
-    assert not widget.audiobook_details_btn.isEnabled()
-    assert widget.selected_audiobook_item() is None
+    # Several checked audiobooks are worked through one at a time rather than
+    # leaving the action dead with no way forward.
+    assert widget.audiobook_details_btn.isEnabled()
+    assert len(widget.selected_audiobook_items()) == 2
 
 
 def test_music_only_selection_disables_the_button(qtbot, tmp_path: Path) -> None:
@@ -137,25 +138,34 @@ def test_selection_count_update_refreshes_the_button(qtbot, tmp_path: Path) -> N
 # ── Resolving the target ────────────────────────────────────────────────────
 
 
-def test_selected_audiobook_item_returns_the_single_audiobook(qtbot, tmp_path: Path) -> None:
+def test_selected_audiobook_items_ignores_other_media(qtbot, tmp_path: Path) -> None:
     widget = _review(qtbot)
     book = _audiobook(tmp_path)
     _with_selection(widget, [_music(tmp_path), book])
 
-    assert widget.selected_audiobook_item() is book
+    assert widget.selected_audiobook_items() == [book]
 
 
-def test_selected_audiobook_item_is_none_without_one(qtbot, tmp_path: Path) -> None:
+def test_selected_audiobook_items_keeps_the_checked_order(qtbot, tmp_path: Path) -> None:
+    widget = _review(qtbot)
+    first = _audiobook(tmp_path, "a.m4b")
+    second = _audiobook(tmp_path, "b.m4b")
+    _with_selection(widget, [first, _music(tmp_path), second])
+
+    assert widget.selected_audiobook_items() == [first, second]
+
+
+def test_selected_audiobook_items_is_empty_without_any(qtbot, tmp_path: Path) -> None:
     widget = _review(qtbot)
     _with_selection(widget, [_music(tmp_path)])
 
-    assert widget.selected_audiobook_item() is None
+    assert widget.selected_audiobook_items() == []
 
 
 # ── Emitting the request ────────────────────────────────────────────────────
 
 
-def test_clicking_emits_the_selected_item(qtbot, tmp_path: Path) -> None:
+def test_clicking_emits_the_checked_audiobook_as_a_list(qtbot, tmp_path: Path) -> None:
     widget = _review(qtbot)
     book = _audiobook(tmp_path)
     _with_selection(widget, [book])
@@ -164,7 +174,21 @@ def test_clicking_emits_the_selected_item(qtbot, tmp_path: Path) -> None:
     with qtbot.waitSignal(widget.audiobook_details_requested, timeout=1000) as blocker:
         widget.audiobook_details_btn.click()
 
-    assert blocker.args[0] is book
+    # One book is just a batch of one, so the receiver has a single shape to handle.
+    assert blocker.args[0] == [book]
+
+
+def test_clicking_emits_every_checked_audiobook(qtbot, tmp_path: Path) -> None:
+    widget = _review(qtbot)
+    first = _audiobook(tmp_path, "a.m4b")
+    second = _audiobook(tmp_path, "b.m4b")
+    _with_selection(widget, [first, second])
+    widget.refresh_audiobook_action()
+
+    with qtbot.waitSignal(widget.audiobook_details_requested, timeout=1000) as blocker:
+        widget.audiobook_details_btn.click()
+
+    assert blocker.args[0] == [first, second]
 
 
 def test_no_signal_when_nothing_qualifies(qtbot, tmp_path: Path) -> None:

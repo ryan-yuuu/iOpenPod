@@ -56,12 +56,15 @@ def book(tmp_path: Path) -> Path:
     return path
 
 
-def _make_dialog(qtbot, path: Path) -> AudiobookMatchDialog:
+def _make_dialog(
+    qtbot, path: Path, *, batch_position: tuple[int, int] | None = None
+) -> AudiobookMatchDialog:
     dlg = AudiobookMatchDialog(
         path,
         search_fn=_no_search,
         detail_fn=_no_detail,
         cover_fn=_no_cover,
+        batch_position=batch_position,
     )
     qtbot.addWidget(dlg)
     return dlg
@@ -230,6 +233,63 @@ def test_dialog_uses_a_themed_modal_background(dialog: AudiobookMatchDialog) -> 
 def test_buttons_are_themed_not_default_styled(dialog: AudiobookMatchDialog) -> None:
     for button in dialog.findChildren(QPushButton):
         assert button.styleSheet(), f"{button.text()!r} has no themed stylesheet"
+
+
+# ── Working through several audiobooks ──────────────────────────────────────
+
+
+def test_single_use_shows_no_skip_button(dialog: AudiobookMatchDialog) -> None:
+    # Shown first: an unshown widget reports invisible whatever its own flag.
+    dialog.show()
+
+    # Nothing to skip to, so the control would only add noise.
+    assert not dialog.skip_button().isVisible()
+
+
+def test_single_use_title_has_no_position(dialog: AudiobookMatchDialog) -> None:
+    assert dialog.windowTitle() == "Find Audiobook Details"
+
+
+def test_batch_mode_offers_a_skip_button(qtbot, book: Path) -> None:
+    dlg = _make_dialog(qtbot, book, batch_position=(2, 5))
+    dlg.show()
+
+    assert dlg.skip_button().isVisible()
+
+
+def test_batch_mode_shows_progress_in_the_title(qtbot, book: Path) -> None:
+    dlg = _make_dialog(qtbot, book, batch_position=(2, 5))
+
+    assert "2 of 5" in dlg.windowTitle()
+
+
+def test_skipping_closes_with_its_own_code(qtbot, book: Path) -> None:
+    dlg = _make_dialog(qtbot, book, batch_position=(1, 3))
+    codes: list[int] = []
+    dlg.finished.connect(codes.append)
+
+    dlg.skip_button().click()
+
+    # Skip must be distinguishable from cancel: one passes over this file,
+    # the other abandons the whole run.
+    assert codes == [AudiobookMatchDialog.Skipped]
+    assert AudiobookMatchDialog.Skipped not in (
+        int(AudiobookMatchDialog.DialogCode.Accepted),
+        int(AudiobookMatchDialog.DialogCode.Rejected),
+    )
+
+
+def test_skipping_emits_no_metadata(qtbot, book: Path) -> None:
+    dlg = _make_dialog(qtbot, book, batch_position=(1, 3))
+
+    with qtbot.assertNotEmitted(dlg.metadata_applied):
+        dlg.skip_button().click()
+
+
+def test_skip_button_is_themed(qtbot, book: Path) -> None:
+    dlg = _make_dialog(qtbot, book, batch_position=(1, 3))
+
+    assert dlg.skip_button().styleSheet()
 
 
 def test_card_marks_selection_with_an_accessible_state(qtbot) -> None:

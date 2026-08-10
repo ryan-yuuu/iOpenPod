@@ -55,9 +55,19 @@ class AudiobookMatchDialog(QDialog):
     Emits ``metadata_applied(AudiobookMetadata)`` when the user confirms a
     match. Writing the tags is the caller's job, so this dialog stays free
     of file I/O.
+
+    A caller working through several audiobooks passes ``batch_position`` to
+    show progress and offer a Skip button. Skipping has to be distinct from
+    cancelling: with only Qt's two exits, closing the dialog on the second of
+    twenty books either abandons the remaining eighteen or cannot pass over
+    one, and neither is what the user meant.
     """
 
     metadata_applied = pyqtSignal(object)  # AudiobookMetadata
+
+    #: Third exit code alongside Qt's Accepted (1) and Rejected (0): leave this
+    #: file alone but carry on with the rest of the batch.
+    Skipped = 2
 
     def __init__(
         self,
@@ -67,6 +77,7 @@ class AudiobookMatchDialog(QDialog):
         search_fn: Callable[..., list[AudiobookCandidate]] | None = None,
         detail_fn: Callable[..., AudiobookMetadata | None] | None = None,
         cover_fn: Callable[[str], bytes] | None = None,
+        batch_position: tuple[int, int] | None = None,
     ):
         """``*_fn`` default to the live clients; tests inject stubs."""
         super().__init__(parent)
@@ -77,8 +88,9 @@ class AudiobookMatchDialog(QDialog):
         self._search_fn = search_fn
         self._detail_fn = detail_fn
         self._cover_fn = cover_fn
+        self._batch_position = batch_position
 
-        self.setWindowTitle("Find Audiobook Details")
+        self.setWindowTitle(self._window_title())
         self.setMinimumSize(560, 480)
         self.resize(640, 560)
         self.setStyleSheet(f"""
@@ -100,6 +112,13 @@ class AudiobookMatchDialog(QDialog):
 
     def apply_button(self) -> QPushButton:
         return self._apply_btn
+
+    def skip_button(self) -> QPushButton:
+        """Only shown in batch mode; hidden otherwise."""
+        return self._skip_btn
+
+    def batch_position(self) -> tuple[int, int] | None:
+        return self._batch_position
 
     def candidate_cards(self) -> list[_CandidateCard]:
         return list(self._cards)
@@ -184,11 +203,23 @@ class AudiobookMatchDialog(QDialog):
         action_row.setSpacing(8)
         action_row.addStretch()
 
+        # Leaves this file untouched and lets the caller move to the next one.
+        self._skip_btn = QPushButton("Skip")
+        self._skip_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
+        self._skip_btn.setStyleSheet(btn_css())
+        self._skip_btn.setFixedHeight(36)
+        self._skip_btn.clicked.connect(self._on_skip)
+        self._skip_btn.setVisible(self._batch_position is not None)
+        self._skip_btn.setToolTip("Leave this audiobook as it is and go to the next")
+        action_row.addWidget(self._skip_btn)
+
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_MD))
         cancel_btn.setStyleSheet(btn_css())
         cancel_btn.setFixedHeight(36)
         cancel_btn.clicked.connect(self.reject)
+        if self._batch_position is not None:
+            cancel_btn.setToolTip("Stop here and leave the remaining audiobooks alone")
         action_row.addWidget(cancel_btn)
 
         self._apply_btn = QPushButton("Apply Details")
@@ -309,6 +340,16 @@ class AudiobookMatchDialog(QDialog):
     def _on_apply(self) -> None:
         if self._resolved is not None:
             self.metadata_applied.emit(self._resolved)
+
+    def _on_skip(self) -> None:
+        self.done(self.Skipped)
+
+    def _window_title(self) -> str:
+        base = "Find Audiobook Details"
+        if self._batch_position is None:
+            return base
+        index, total = self._batch_position
+        return f"{base} — {index} of {total}"
 
     # ── Helpers ──────────────────────────────────────────────────────────
 

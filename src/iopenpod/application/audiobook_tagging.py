@@ -103,3 +103,57 @@ def describe_pending_changes(
     from iopenpod.audiobooks.tagger import describe_changes
 
     return describe_changes(path, metadata)
+
+
+@dataclass(frozen=True)
+class AudiobookRunSummary:
+    """What happened across a run over one or more audiobooks."""
+
+    total: int
+    applied: tuple[str, ...] = ()
+    unchanged: tuple[str, ...] = ()
+    skipped: tuple[str, ...] = ()
+    problems: tuple[str, ...] = ()
+    stopped_at: int | None = None
+
+    @property
+    def untouched(self) -> int:
+        """Books never reached because the run was stopped part way."""
+        if self.stopped_at is None:
+            return 0
+        return max(0, self.total - self.stopped_at + 1)
+
+    @property
+    def has_problems(self) -> bool:
+        return bool(self.problems)
+
+
+def summarize_tagging_run(summary: AudiobookRunSummary) -> str:
+    """Compose the end-of-run report shown once, instead of after each book.
+
+    Returns an empty string when there is nothing worth saying, so the caller
+    can skip the dialog entirely.
+    """
+    lines: list[str] = []
+    if summary.applied:
+        lines.append(f"Updated {len(summary.applied)}: {', '.join(summary.applied)}")
+    if summary.unchanged:
+        lines.append(
+            f"Already up to date {len(summary.unchanged)}: {', '.join(summary.unchanged)}"
+        )
+    if summary.skipped:
+        lines.append(f"Skipped {len(summary.skipped)}: {', '.join(summary.skipped)}")
+    if summary.untouched:
+        lines.append(f"Stopped early — {summary.untouched} left untouched.")
+    if summary.problems:
+        if lines:
+            lines.append("")
+        lines.append("Problems:")
+        lines.extend(f"  {problem}" for problem in summary.problems)
+
+    if not lines:
+        return ""
+    if summary.applied:
+        lines.append("")
+        lines.append("Re-scan or drop the files again to refresh the sync plan.")
+    return "\n".join(lines)

@@ -1712,7 +1712,7 @@ class SyncReviewWidget(QWidget):
 
     sync_requested = pyqtSignal(object)  # Emits selected sync items
     edit_selection_requested = pyqtSignal(object)
-    audiobook_details_requested = pyqtSignal(object)  # Emits one sync item
+    audiobook_details_requested = pyqtSignal(object)  # Emits list[sync item]
     skip_backup_signal = pyqtSignal()  # Skip the in-progress pre-sync backup
     give_up_scrobble_signal = pyqtSignal()  # Stop retrying scrobble timeouts
     cancelled = pyqtSignal()
@@ -2183,7 +2183,7 @@ class SyncReviewWidget(QWidget):
         self.audiobook_details_btn.setStyleSheet(quiet_footer_btn_css)
         self.audiobook_details_btn.setEnabled(False)
         self.audiobook_details_btn.setToolTip(
-            "Look up title, author, narrator, and cover art for the checked audiobook"
+            "Look up title, author, narrator, and cover art for the checked audiobooks"
         )
 
         self.edit_selection_btn = QPushButton("Edit Selection", footer)
@@ -3802,28 +3802,26 @@ class SyncReviewWidget(QWidget):
             return
         self.edit_selection_requested.emit(self.get_selection_state())
 
-    def selected_audiobook_item(self) -> Any | None:
-        """The one checked audiobook, or ``None`` when the action cannot apply.
+    def selected_audiobook_items(self) -> list[Any]:
+        """Every checked audiobook, in the order they appear in the plan.
 
-        Two or more checked audiobooks leave no unambiguous target, so the
-        action is withheld rather than guessing.
+        The receiver works through them one at a time. Withholding the action
+        for anything but a single selection used to leave a user with a shelf
+        of audiobooks facing a disabled button and no way forward.
         """
         from iopenpod.application.audiobook_tagging import is_taggable_audiobook
 
-        audiobooks = [item for item in self._get_selected_items() if is_taggable_audiobook(item)]
-        if len(audiobooks) != 1:
-            return None
-        return audiobooks[0]
+        return [item for item in self._get_selected_items() if is_taggable_audiobook(item)]
 
     def refresh_audiobook_action(self) -> None:
-        """Enable the details action only when exactly one audiobook is checked."""
-        self.audiobook_details_btn.setEnabled(self.selected_audiobook_item() is not None)
+        """Enable the details action when at least one audiobook is checked."""
+        self.audiobook_details_btn.setEnabled(bool(self.selected_audiobook_items()))
 
     def _on_audiobook_details(self) -> None:
-        item = self.selected_audiobook_item()
-        if item is None:
+        items = self.selected_audiobook_items()
+        if not items:
             return
-        self.audiobook_details_requested.emit(item)
+        self.audiobook_details_requested.emit(items)
 
     def get_selected_photo_plan(self):
         if self._plan is None or self._plan.photo_plan is None:
