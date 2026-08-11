@@ -16,10 +16,9 @@ from iopenpod.application.services import (
 from iopenpod.gui.styles import paint_css
 from iopenpod.gui.widgets.podcastBrowser import (
     _COMBINED_FEED_COLUMNS,
-    _EPISODE_ARTWORK_COLLAPSED_HEIGHT,
-    _EPISODE_ROW_GAP,
     _PODCAST_EPISODE_COLUMNS,
     PodcastBrowser,
+    _card_vertical_metrics,
     _episode_description_text,
     _episode_is_listened,
     _episode_key,
@@ -39,6 +38,18 @@ from iopenpod.podcasts.models import (
     PodcastEpisode,
     PodcastFeed,
 )
+
+
+def _collapsed_card_height(title: str = "Episode", *, show_more: bool = True) -> int:
+    """The height the pooled list would hand a card of this shape."""
+    return _card_vertical_metrics(
+        card_width=900,
+        show_artwork=True,
+        has_podcast_label=True,
+        title_text=title,
+        show_status=False,
+        show_action_row=show_more,
+    ).total
 
 
 def test_http_artwork_source_is_remote() -> None:
@@ -324,7 +335,7 @@ def test_episode_card_carries_no_inline_ipod_action_buttons(qtbot) -> None:
     """Both Add and Remove are driven by row selection plus the batch bar."""
     card = _PodcastEpisodeCard()
     qtbot.addWidget(card)
-    card.resize(900, _EPISODE_ARTWORK_COLLAPSED_HEIGHT - _EPISODE_ROW_GAP)
+    card.resize(900, _collapsed_card_height())
     card.show()
 
     row = {
@@ -356,7 +367,7 @@ def test_episode_card_carries_no_inline_ipod_action_buttons(qtbot) -> None:
 def test_episode_card_checkbox_emits_the_row_it_belongs_to(qtbot) -> None:
     card = _PodcastEpisodeCard()
     qtbot.addWidget(card)
-    card.resize(900, _EPISODE_ARTWORK_COLLAPSED_HEIGHT - _EPISODE_ROW_GAP)
+    card.resize(900, _collapsed_card_height())
     card.show()
 
     toggles: list[tuple[int, bool]] = []
@@ -397,7 +408,7 @@ def test_episode_card_checkbox_emits_the_row_it_belongs_to(qtbot) -> None:
 def test_episode_card_checkbox_is_hidden_until_it_is_wanted(qtbot) -> None:
     card = _PodcastEpisodeCard()
     qtbot.addWidget(card)
-    card.resize(900, _EPISODE_ARTWORK_COLLAPSED_HEIGHT - _EPISODE_ROW_GAP)
+    card.resize(900, _collapsed_card_height())
     card.show()
 
     row = {
@@ -456,7 +467,7 @@ def test_episode_card_description_toggle_keeps_spacing_stable(qtbot) -> None:
         artwork_pixmap=QPixmap(4, 4),
     )
 
-    card.resize(900, _EPISODE_ARTWORK_COLLAPSED_HEIGHT - _EPISODE_ROW_GAP)
+    card.resize(900, _collapsed_card_height())
     card.show()
     qtbot.wait(10)
 
@@ -533,7 +544,7 @@ def test_episode_card_child_context_menu_events_reach_card(qtbot) -> None:
         artwork_source="cover",
         artwork_pixmap=QPixmap(4, 4),
     )
-    card.resize(900, _EPISODE_ARTWORK_COLLAPSED_HEIGHT - _EPISODE_ROW_GAP)
+    card.resize(900, _collapsed_card_height())
     card.show()
     qtbot.wait(10)
 
@@ -564,8 +575,9 @@ def test_episode_list_context_menu_signal_is_connected(qtbot) -> None:
 
     owner = _Owner()
     qtbot.addWidget(owner)
+    # Owned by `owner`, so registering it with qtbot as well would delete it
+    # twice at teardown.
     episode_list = _PodcastEpisodeList(cast(PodcastBrowser, owner))
-    qtbot.addWidget(episode_list)
 
     pos = QPoint(11, 13)
     episode_list.table.customContextMenuRequested.emit(pos)
@@ -581,7 +593,6 @@ def test_episode_list_uses_app_scrollbar_style_path(qtbot) -> None:
     owner = _Owner()
     qtbot.addWidget(owner)
     episode_list = _PodcastEpisodeList(cast(PodcastBrowser, owner))
-    qtbot.addWidget(episode_list)
 
     table = episode_list.table
 

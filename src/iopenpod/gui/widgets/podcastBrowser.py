@@ -28,7 +28,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from PyQt6.QtCore import (
     QEvent,
@@ -268,8 +268,8 @@ _EPISODE_ACTION_ROW_HEIGHT = 24
 _EPISODE_CHECKBOX_SIZE = 18
 _EPISODE_CHECKBOX_GAP = 10
 _EPISODE_DESC_COLLAPSED_LINES = 2
-_EPISODE_COLLAPSED_HEIGHT = 158
-_EPISODE_ARTWORK_COLLAPSED_HEIGHT = 174
+_EPISODE_STATUS_MAX_WIDTH = 132
+_EPISODE_TITLE_MAX_HEIGHT = 42
 _EPISODE_EXPANDED_MAX_LINES = 14
 _EPISODE_ROW_GAP = 8
 _EPISODE_ROW_BUFFER = 4
@@ -416,6 +416,91 @@ def _wrap_lines(
     return lines, truncated
 
 
+def _clamp_desc_lines(lines: int) -> int:
+    """Lines a collapsed description occupies, never more than the cap."""
+    return max(1, min(_EPISODE_DESC_COLLAPSED_LINES, lines))
+
+
+def _wrapped_line_count(text: str) -> int:
+    """Line count of text already wrapped by :func:`_wrap_lines`."""
+    return str(text or "").count("\n") + 1
+
+
+class _CardVerticalMetrics(NamedTuple):
+    """Vertical geometry of one collapsed episode card."""
+
+    top_h: int        # Artwork beside the show name and wrapped title.
+    meta_h: int
+    desc_min_h: int
+    action_h: int     # Zero when the action row has nothing to show.
+    total: int        # Full card frame height.
+
+
+def _card_vertical_metrics(
+    *,
+    card_width: int,
+    show_artwork: bool,
+    has_podcast_label: bool,
+    title_text: str,
+    show_status: bool,
+    show_action_row: bool,
+    desc_lines: int = _EPISODE_DESC_COLLAPSED_LINES,
+) -> _CardVerticalMetrics:
+    """Measure a collapsed card so it is exactly as tall as its content.
+
+    The pooled list needs a row's height before any widget exists for it, and
+    the card lays itself out inside whatever height it is given. Deriving both
+    from this one function keeps them from disagreeing — a disagreement shows
+    up either as a band of dead space under every card or as a clipped
+    action row.
+    """
+    small = QFontMetrics(QFont(FONT_FAMILY, Metrics.FONT_SM))
+    title_metrics = QFontMetrics(
+        QFont(FONT_FAMILY, Metrics.FONT_MD, QFont.Weight.DemiBold)
+    )
+
+    left = _EPISODE_CARD_PADDING + _EPISODE_CHECKBOX_SIZE + _EPISODE_CHECKBOX_GAP
+    width = max(1, card_width - left - _EPISODE_CARD_PADDING)
+    art_size = _EPISODE_CARD_ARTWORK_SIZE if show_artwork else 0
+    title_x = left + (art_size + _EPISODE_TOP_ROW_GAP if show_artwork else 0)
+    status_w = _EPISODE_STATUS_MAX_WIDTH if show_status else 0
+    status_gap = _EPISODE_TOP_ROW_GAP if show_status else 0
+    title_w = max(1, left + width - title_x - status_gap - status_w)
+
+    podcast_h = small.lineSpacing() if has_podcast_label else 0
+    bounds = title_metrics.boundingRect(
+        QRect(0, 0, title_w, 200),
+        Qt.TextFlag.TextWordWrap,
+        title_text or "Untitled Episode",
+    )
+    title_h = min(
+        max(title_metrics.lineSpacing(), bounds.height()),
+        max(title_metrics.lineSpacing(), _EPISODE_TITLE_MAX_HEIGHT),
+    )
+    title_block_h = (
+        podcast_h
+        + (_EPISODE_TITLE_LABEL_GAP if has_podcast_label else 0)
+        + title_h
+    )
+    top_h = max(art_size, title_block_h)
+
+    meta_h = small.lineSpacing()
+    desc_min_h = _clamp_desc_lines(desc_lines) * small.lineSpacing()
+    action_h = _EPISODE_ACTION_ROW_HEIGHT if show_action_row else 0
+
+    total = (
+        _EPISODE_CARD_VPAD
+        + top_h
+        + _EPISODE_CARD_SPACING
+        + meta_h
+        + _EPISODE_CARD_SPACING
+        + desc_min_h
+        + (_EPISODE_CARD_SPACING + action_h if show_action_row else 0)
+        + _EPISODE_CARD_VPAD
+    )
+    return _CardVerticalMetrics(top_h, meta_h, desc_min_h, action_h, total)
+
+
 class _PodcastCardMouseButton(QPushButton):
     """Button that does not steal the row's selection state."""
 
@@ -501,7 +586,7 @@ class _PodcastEpisodeCard(QFrame):
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
         )
         self._title_label.setWordWrap(True)
-        self._title_label.setMaximumHeight(42)
+        self._title_label.setMaximumHeight(_EPISODE_TITLE_MAX_HEIGHT)
 
         self._status_label = make_label(
             "",
@@ -511,7 +596,7 @@ class _PodcastEpisodeCard(QFrame):
         self._status_label.setParent(self)
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._status_label.setMinimumWidth(86)
-        self._status_label.setMaximumWidth(132)
+        self._status_label.setMaximumWidth(_EPISODE_STATUS_MAX_WIDTH)
 
         self._meta_label = make_label("", size=Metrics.FONT_SM, style=LABEL_SECONDARY())
         self._meta_label.setParent(self)
@@ -668,10 +753,12 @@ class _PodcastEpisodeCard(QFrame):
         if expanded:
             line_count = max(
                 1,
-                min(_EPISODE_EXPANDED_MAX_LINES, str(text or "").count("\n") + 1),
+                min(_EPISODE_EXPANDED_MAX_LINES, _wrapped_line_count(text)),
             )
         else:
-            line_count = _EPISODE_DESC_COLLAPSED_LINES
+            # Only the lines actually used, so a one-line summary does not
+            # reserve a second line's worth of blank card.
+            line_count = _clamp_desc_lines(_wrapped_line_count(text))
         self._description_label.setMinimumHeight(line_count * metrics.lineSpacing())
         self._description_label.setMaximumHeight(16777215)
 
@@ -756,16 +843,16 @@ class _PodcastEpisodeCard(QFrame):
         self._meta_label.setGeometry(left, meta_y, width, meta_h)
 
         desc_y = meta_y + meta_h + _EPISODE_CARD_SPACING
+        # With nothing to put in it, the action row claims no height — its
+        # reserved band was the dead space under every short episode.
+        action_h = (
+            _EPISODE_ACTION_ROW_HEIGHT if not self._more_btn.isHidden() else 0
+        )
         action_y = max(
             desc_y + self._description_label.minimumHeight() + _EPISODE_CARD_SPACING,
-            self.height() - _EPISODE_CARD_VPAD - _EPISODE_ACTION_ROW_HEIGHT,
+            self.height() - _EPISODE_CARD_VPAD - action_h,
         )
-        self._action_row.setGeometry(
-            left,
-            action_y,
-            width,
-            _EPISODE_ACTION_ROW_HEIGHT,
-        )
+        self._action_row.setGeometry(left, action_y, width, action_h)
 
         self._more_btn.setGeometry(
             max(0, width - self._more_btn.width()),
@@ -916,6 +1003,7 @@ class _PodcastEpisodeList(QFrame):
         self._row_heights: list[int] = []
         self._row_offsets: list[int] = [0]
         self._expanded_text_cache: dict[tuple[str, int], tuple[str, int]] = {}
+        self._collapsed_height_cache: dict[tuple[str, int], int] = {}
 
         self._widget_pool: list[_PodcastEpisodeCard] = []
         self._visible_widgets: dict[int, _PodcastEpisodeCard] = {}
@@ -965,6 +1053,7 @@ class _PodcastEpisodeList(QFrame):
         self._selection_anchor = None
         self._selection_was_active = bool(self._selected_rows)
         self._expanded_text_cache.clear()
+        self._collapsed_height_cache.clear()
         self._requested_artwork_sources.clear()
         self._rebuild_heights()
         self._reset_scroll_position()
@@ -1047,10 +1136,28 @@ class _PodcastEpisodeList(QFrame):
     def _shows_podcast_artwork(self) -> bool:
         return "podcast_feed_title" in self._columns
 
-    def _collapsed_height_for_row(self, _row: dict) -> int:
-        if self._shows_podcast_artwork():
-            return _EPISODE_ARTWORK_COLLAPSED_HEIGHT
-        return _EPISODE_COLLAPSED_HEIGHT
+    def _collapsed_height_for_row(self, row: dict) -> int:
+        """Height of one collapsed row, sized to that row's own content."""
+        card_width = self._card_width()
+        cache_key = (self._row_key(row), card_width)
+        cached = self._collapsed_height_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        text, truncated = self._collapsed_description(row, card_width)
+        metrics = _card_vertical_metrics(
+            card_width=card_width,
+            show_artwork=self._shows_podcast_artwork(),
+            has_podcast_label=bool(row.get("podcast_feed_title")),
+            title_text=str(row.get("Title") or ""),
+            show_status=_is_state_status(str(row.get("ep_status") or "")),
+            show_action_row=truncated,
+            desc_lines=_wrapped_line_count(text),
+        )
+        # Row pitch includes the gap the viewport subtracts back off again.
+        height = metrics.total + _EPISODE_ROW_GAP
+        self._collapsed_height_cache[cache_key] = height
+        return height
 
     def _rebuild_heights(self) -> None:
         self._row_heights = [
@@ -1150,6 +1257,7 @@ class _PodcastEpisodeList(QFrame):
         total_height = self._row_offsets[-1] if self._row_offsets else 0
         if self._content.width() != width:
             self._expanded_text_cache.clear()
+            self._collapsed_height_cache.clear()
             self._rebuild_heights()
             width = self._content_width()
             total_height = self._row_offsets[-1] if self._row_offsets else 0
