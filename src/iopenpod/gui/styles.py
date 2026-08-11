@@ -1293,6 +1293,15 @@ def checkbox_css(font_size: int | None = None) -> str:
             background: {paint_css('control.primary.fill')};
             border-color: {paint_css('control.primary.fill')};
         }}
+        /* "Some, not all" for tri-state boxes: accented like checked, but
+           hollow, so a partial selection never reads as a full one. */
+        QCheckBox::indicator:indeterminate {{
+            background: {paint_css('surface.inset')};
+            border: 5px solid {paint_css('control.primary.fill')};
+        }}
+        QCheckBox::indicator:indeterminate:hover {{
+            border-color: {paint_css('control.primary.hover_fill')};
+        }}
         QCheckBox::indicator:checked:hover {{
             background: {paint_css('control.primary.hover_fill')};
             border-color: {paint_css('control.primary.hover_fill')};

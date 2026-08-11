@@ -320,7 +320,7 @@ def test_browser_remove_download_preserves_episode_when_path_is_refused(
         def __init__(self) -> None:
             self.statuses: list[str] = []
 
-        def _show_episodes(self, _feed) -> None:
+        def _refresh_current_view(self) -> None:
             pass
 
         def _refresh_feed_list(self) -> None:

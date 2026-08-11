@@ -52,7 +52,7 @@ def test_episode_card_uses_resolved_episode_and_action_paints(qtbot) -> None:
     qtbot.addWidget(card)
 
     assert paint_css("podcast.episode.fill") in card.styleSheet()
-    assert paint_css("status.danger.subtle_fill") in card._remove_btn.styleSheet()
+    assert paint_css("control.primary.fill") in card._check.styleSheet()
 
 
 def test_status_timeouts_are_cancelled_when_podcast_browser_is_destroyed(qtbot) -> None:
@@ -320,23 +320,20 @@ def test_episode_card_artwork_only_shows_for_combined_feed(qtbot) -> None:
     assert not art_label.isVisibleTo(card)
 
 
-def test_episode_card_shows_and_emits_ipod_action_buttons(qtbot) -> None:
-    """Only Remove lives on the card; adding is driven by row selection."""
+def test_episode_card_carries_no_inline_ipod_action_buttons(qtbot) -> None:
+    """Both Add and Remove are driven by row selection plus the batch bar."""
     card = _PodcastEpisodeCard()
     qtbot.addWidget(card)
     card.resize(900, _EPISODE_ARTWORK_COLLAPSED_HEIGHT - _EPISODE_ROW_GAP)
     card.show()
 
-    remove_seen: list[int] = []
-    card.remove_requested.connect(remove_seen.append)
-
     row = {
         "Title": "Episode",
         "podcast_feed_title": "Example Show",
         "Description Text": "Description",
-        "ep_status": "Downloaded",
-        "_can_add_to_ipod": True,
-        "_can_remove_from_ipod": False,
+        "ep_status": "On iPod",
+        "_can_add_to_ipod": False,
+        "_can_remove_from_ipod": True,
     }
     card.bind(
         row_index=7,
@@ -352,16 +349,27 @@ def test_episode_card_shows_and_emits_ipod_action_buttons(qtbot) -> None:
     )
 
     assert card.findChild(QPushButton, "podcastEpisodeAddButton") is None
-    remove_button = card.findChild(QPushButton, "podcastEpisodeRemoveButton")
-    assert remove_button is not None
-    assert not remove_button.isVisibleTo(card)
-    assert remove_seen == []
+    assert card.findChild(QPushButton, "podcastEpisodeRemoveButton") is None
+    assert not hasattr(card, "remove_requested")
 
-    row["_can_add_to_ipod"] = False
-    row["_can_remove_from_ipod"] = True
+
+def test_episode_card_checkbox_emits_the_row_it_belongs_to(qtbot) -> None:
+    card = _PodcastEpisodeCard()
+    qtbot.addWidget(card)
+    card.resize(900, _EPISODE_ARTWORK_COLLAPSED_HEIGHT - _EPISODE_ROW_GAP)
+    card.show()
+
+    toggles: list[tuple[int, bool]] = []
+    card.check_toggled.connect(lambda row, on: toggles.append((row, on)))
+
     card.bind(
         row_index=8,
-        row=row,
+        row={
+            "Title": "Episode",
+            "podcast_feed_title": "Example Show",
+            "Description Text": "Description",
+            "ep_status": "On iPod",
+        },
         row_key="row-8",
         selected=False,
         expanded=False,
@@ -372,11 +380,54 @@ def test_episode_card_shows_and_emits_ipod_action_buttons(qtbot) -> None:
         artwork_pixmap=QPixmap(4, 4),
     )
 
-    assert remove_button.isVisibleTo(card)
+    # Rebinding a pooled card must not read as the user clicking the box.
+    assert toggles == []
 
-    qtbot.mouseClick(remove_button, Qt.MouseButton.LeftButton)
+    card._check.setChecked(True)
 
-    assert remove_seen == [8]
+    # Programmatic state changes stay silent; only real activation reports.
+    assert toggles == []
+
+    card._check.setChecked(False)
+    card._check.click()
+
+    assert toggles == [(8, True)]
+
+
+def test_episode_card_checkbox_is_hidden_until_it_is_wanted(qtbot) -> None:
+    card = _PodcastEpisodeCard()
+    qtbot.addWidget(card)
+    card.resize(900, _EPISODE_ARTWORK_COLLAPSED_HEIGHT - _EPISODE_ROW_GAP)
+    card.show()
+
+    row = {
+        "Title": "Episode",
+        "podcast_feed_title": "Example Show",
+        "Description Text": "Description",
+        "ep_status": "",
+    }
+    kwargs = dict(
+        row=row,
+        row_key="row-1",
+        expanded=False,
+        description_text="Description",
+        show_more=True,
+        show_artwork=True,
+        artwork_source="cover",
+        artwork_pixmap=QPixmap(4, 4),
+    )
+
+    # Resting state: nothing selected anywhere, pointer elsewhere.
+    card.bind(row_index=1, selected=False, selection_active=False, **kwargs)
+    assert not card._check.isVisibleTo(card)
+
+    # Once a batch exists, every row advertises how to join it.
+    card.bind(row_index=1, selected=False, selection_active=True, **kwargs)
+    assert card._check.isVisibleTo(card)
+
+    card.bind(row_index=1, selected=True, selection_active=True, **kwargs)
+    assert card._check.isVisibleTo(card)
+    assert card._check.isChecked()
 
 
 def test_episode_card_description_toggle_keeps_spacing_stable(qtbot) -> None:

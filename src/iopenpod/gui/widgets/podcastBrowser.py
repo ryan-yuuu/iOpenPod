@@ -47,6 +47,7 @@ from PyQt6.QtGui import (
     QFontMetrics,
     QIcon,
     QImage,
+    QKeyEvent,
     QMouseEvent,
     QPainter,
     QPalette,
@@ -54,10 +55,12 @@ from PyQt6.QtGui import (
     QResizeEvent,
 )
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMenu,
@@ -79,14 +82,19 @@ from ..artwork_rendering import dominant_artwork_color_from_pixmap
 from ..glyphs import glyph_icon, glyph_pixmap
 from ..hidpi import scale_pixmap_for_display
 from ..styles import (
+    BROWSER_SEARCH_CONTROL_SIZE,
+    BROWSER_SEARCH_FIELD_WIDTH,
     FONT_FAMILY,
     LABEL_SECONDARY,
     Metrics,
     accent_btn_css,
+    browser_search_field_css,
     btn_css,
+    checkbox_css,
     combo_css,
     context_menu_css,
     current_theme,
+    danger_btn_css,
     make_label,
     make_separator,
     paint_css,
@@ -208,6 +216,42 @@ _COMBINED_FEED_COLUMNS = [
     "size",
 ]
 _COMBINED_FEED_KEY = "__iopenpod_combined_feed__"
+_ON_IPOD_KEY = "__iopenpod_on_ipod__"
+
+# ── Episode view modes ───────────────────────────────────────────────────────
+# Which of the three episode views the right-hand panel is currently showing.
+# Every re-render funnels through PodcastBrowser._refresh_current_view() so a
+# view can never be forgotten by one of the many status-change call sites.
+_VIEW_SHOW = "show"        # A single subscribed feed.
+_VIEW_FEED = "feed"        # Every subscribed episode, newest first.
+_VIEW_ON_IPOD = "on_ipod"  # Every podcast episode present on the device.
+
+# ── On iPod view ─────────────────────────────────────────────────────────────
+_PODCAST_MEDIA_TYPE_BIT = 0x04
+
+# Feeds fabricated to host podcasts found on the iPod that belong to no
+# subscription. They exist only to render and remove those episodes, and must
+# never reach the subscription store — see _is_synthetic_feed().
+_ORPHAN_FEED_PREFIX = "__iopenpod_orphan__:"
+
+_SEARCH_DEBOUNCE_MS = 120
+
+_SORT_NEWEST = "newest"
+_SORT_OLDEST = "oldest"
+_SORT_LARGEST = "largest"
+_SORT_SHOW = "show"
+_ON_IPOD_SORT_LABELS = {
+    "Recently added": _SORT_NEWEST,
+    "Oldest first": _SORT_OLDEST,
+    "Largest first": _SORT_LARGEST,
+    "By show": _SORT_SHOW,
+}
+
+
+def _is_synthetic_feed(feed: object) -> bool:
+    """True for the placeholder feeds standing in for unsubscribed podcasts."""
+    return str(getattr(feed, "feed_url", "") or "").startswith(_ORPHAN_FEED_PREFIX)
+
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _CSS_RGBA_RE = re.compile(r"rgba?\((\d+),(\d+),(\d+)(?:,(\d+))?\)")
 _EPISODE_DESCRIPTION_MAX_CHARS = 1600
@@ -221,8 +265,8 @@ _EPISODE_CARD_SPACING = 4
 _EPISODE_TOP_ROW_GAP = 10
 _EPISODE_TITLE_LABEL_GAP = 2
 _EPISODE_ACTION_ROW_HEIGHT = 24
-_EPISODE_ACTION_BUTTON_GAP = 6
-_EPISODE_ACTION_ICON_BUTTON_WIDTH = 30
+_EPISODE_CHECKBOX_SIZE = 18
+_EPISODE_CHECKBOX_GAP = 10
 _EPISODE_DESC_COLLAPSED_LINES = 2
 _EPISODE_COLLAPSED_HEIGHT = 158
 _EPISODE_ARTWORK_COLLAPSED_HEIGHT = 174
@@ -384,7 +428,7 @@ class _PodcastCardMouseButton(QPushButton):
 class _PodcastEpisodeCard(QFrame):
     clicked = pyqtSignal(int, object)
     more_requested = pyqtSignal(int)
-    remove_requested = pyqtSignal(int)
+    check_toggled = pyqtSignal(int, bool)
     context_requested = pyqtSignal(int, QPoint)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -393,11 +437,32 @@ class _PodcastEpisodeCard(QFrame):
         self._row_key = ""
         self._artwork_source = ""
         self._selected = False
+        self._selection_active = False
+        self._hovered = False
 
         self.setObjectName("podcastEpisodeCard")
         self.setMouseTracking(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._emit_context_menu)
+
+        # The explicit multi-select affordance. It stays out of the way while
+        # browsing and appears on hover, or for every row once a selection
+        # exists, so building a batch never depends on a modifier key.
+        self._check = QCheckBox(self)
+        self._check.setObjectName("podcastEpisodeCheck")
+        self._check.setStyleSheet(checkbox_css(Metrics.FONT_SM))
+        self._check.setFixedSize(
+            _EPISODE_CHECKBOX_SIZE,
+            _EPISODE_CHECKBOX_SIZE,
+        )
+        self._check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # `clicked`, not `toggled`: these cards are pooled and rebound
+        # constantly, and `toggled` also fires for programmatic state changes
+        # and during teardown — re-entering the list to rebind widgets that may
+        # already be gone.
+        self._check.clicked.connect(self._emit_check_toggled)
+        self._check.hide()
 
         self._art_label = QLabel(self)
         self._art_label.setObjectName("podcastEpisodeArtwork")
@@ -477,45 +542,8 @@ class _PodcastEpisodeCard(QFrame):
         self._action_row.setObjectName("podcastEpisodeActionRow")
         self._action_row.setFixedHeight(_EPISODE_ACTION_ROW_HEIGHT)
 
-        # Adding is driven by row selection plus the batch confirm bar, so the
-        # card carries no add button of its own.
-        self._remove_btn = _PodcastCardMouseButton(
-            "Remove from iPod",
-            self._action_row,
-        )
-        self._remove_btn.setObjectName("podcastEpisodeRemoveButton")
-        self._remove_btn.setToolTip("Remove this episode from iPod")
-        self._remove_btn.setFont(
-            QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold)
-        )
-        self._remove_btn.setStyleSheet(
-            btn_css(
-                bg="transparent",
-                bg_hover=paint_css("status.danger.subtle_fill"),
-                bg_press=paint_css("status.danger.hover_fill"),
-                fg=paint_css("status.danger.text"),
-                border=f"1px solid {paint_css('status.danger.border')}",
-                padding="3px 9px",
-                radius=Metrics.BORDER_RADIUS_SM,
-            )
-        )
-        remove_icon = glyph_icon("minus", 13, paint_css("status.danger.text"))
-        if remove_icon:
-            self._remove_btn.setIcon(remove_icon)
-            self._remove_btn.setIconSize(QSize(13, 13))
-        remove_metrics = QFontMetrics(self._remove_btn.font())
-        self._remove_btn_full_text = "Remove from iPod"
-        self._remove_btn_full_width = remove_metrics.horizontalAdvance(
-            self._remove_btn_full_text
-        ) + 34
-        self._remove_btn.setFixedSize(
-            self._remove_btn_full_width,
-            _EPISODE_ACTION_ROW_HEIGHT,
-        )
-        self._remove_btn.clicked.connect(
-            lambda: self.remove_requested.emit(self._row_index)
-        )
-
+        # Both adding and removing are driven by row selection plus the batch
+        # action bar, so the card carries no add or remove button of its own.
         self._more_btn = _PodcastCardMouseButton("More", self._action_row)
         self._more_btn.setObjectName("podcastEpisodeMoreButton")
         self._more_btn.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold))
@@ -545,10 +573,19 @@ class _PodcastEpisodeCard(QFrame):
             self._meta_label,
             self._description_label,
             self._action_row,
-            self._remove_btn,
             self._more_btn,
         ):
             child.installEventFilter(self)
+
+    def _emit_check_toggled(self, checked: bool) -> None:
+        if self._row_index >= 0:
+            self.check_toggled.emit(self._row_index, checked)
+
+    def _update_check_visibility(self) -> None:
+        """Reveal the checkbox on hover, and whenever a selection is active."""
+        self._check.setVisible(
+            self._selected or self._selection_active or self._hovered
+        )
 
     def bind(
         self,
@@ -558,6 +595,7 @@ class _PodcastEpisodeCard(QFrame):
         row_key: str,
         selected: bool,
         expanded: bool,
+        selection_active: bool = False,
         description_text: str,
         show_more: bool,
         show_artwork: bool,
@@ -568,6 +606,13 @@ class _PodcastEpisodeCard(QFrame):
         self._row_key = row_key
         self._artwork_source = artwork_source if show_artwork else ""
         self._selected = selected
+        self._selection_active = selection_active
+
+        self._check.setChecked(selected)
+        self._check.setAccessibleName(
+            f"Select {row.get('Title') or 'episode'}"
+        )
+        self._update_check_visibility()
 
         self._art_label.setVisible(show_artwork)
         if show_artwork:
@@ -597,7 +642,6 @@ class _PodcastEpisodeCard(QFrame):
 
         self._more_btn.setText("Show less" if expanded else "More")
         self._more_btn.setVisible(show_more)
-        self._remove_btn.setVisible(bool(row.get("_can_remove_from_ipod")))
         self._update_card_layout()
         self._apply_style()
 
@@ -647,9 +691,18 @@ class _PodcastEpisodeCard(QFrame):
         )
 
     def _update_card_layout(self) -> None:
-        left = _EPISODE_CARD_PADDING
         top = _EPISODE_CARD_VPAD
-        width = max(1, self.width() - 2 * _EPISODE_CARD_PADDING)
+
+        # The checkbox owns a fixed leading column so rows stay aligned whether
+        # or not it is currently revealed.
+        self._check.setGeometry(
+            _EPISODE_CARD_PADDING,
+            top + (_EPISODE_CARD_ARTWORK_SIZE - _EPISODE_CHECKBOX_SIZE) // 2,
+            _EPISODE_CHECKBOX_SIZE,
+            _EPISODE_CHECKBOX_SIZE,
+        )
+        left = _EPISODE_CARD_PADDING + _EPISODE_CHECKBOX_SIZE + _EPISODE_CHECKBOX_GAP
+        width = max(1, self.width() - left - _EPISODE_CARD_PADDING)
 
         art_visible = not self._art_label.isHidden()
         art_size = _EPISODE_CARD_ARTWORK_SIZE if art_visible else 0
@@ -714,43 +767,6 @@ class _PodcastEpisodeCard(QFrame):
             _EPISODE_ACTION_ROW_HEIGHT,
         )
 
-        more_visible = not self._more_btn.isHidden()
-        more_w = self._more_btn.width() if more_visible else 0
-        action_limit = width
-        if more_visible:
-            action_limit = max(0, width - more_w - _EPISODE_ACTION_BUTTON_GAP)
-
-        action_x = 0
-        for button, full_text, full_width in (
-            (
-                self._remove_btn,
-                self._remove_btn_full_text,
-                self._remove_btn_full_width,
-            ),
-        ):
-            if button.isHidden():
-                button.setGeometry(0, 0, 0, 0)
-                continue
-            compact = (
-                action_x + full_width > action_limit
-                and not button.icon().isNull()
-            )
-            target_text = "" if compact else full_text
-            target_w = (
-                _EPISODE_ACTION_ICON_BUTTON_WIDTH if compact else full_width
-            )
-            if button.text() != target_text:
-                button.setText(target_text)
-            if button.width() != target_w:
-                button.setFixedWidth(target_w)
-            button.setGeometry(
-                action_x,
-                0,
-                target_w,
-                _EPISODE_ACTION_ROW_HEIGHT,
-            )
-            action_x += target_w + _EPISODE_ACTION_BUTTON_GAP
-
         self._more_btn.setGeometry(
             max(0, width - self._more_btn.width()),
             0,
@@ -791,6 +807,16 @@ class _PodcastEpisodeCard(QFrame):
         super().resizeEvent(a0)
         self._update_card_layout()
 
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        self._hovered = True
+        self._update_check_visibility()
+        super().enterEvent(event)
+
+    def leaveEvent(self, a0: QEvent | None) -> None:
+        self._hovered = False
+        self._update_check_visibility()
+        super().leaveEvent(a0)
+
     def contextMenuEvent(self, a0: QContextMenuEvent | None) -> None:
         if a0 is not None:
             self._emit_context_menu(a0.pos())
@@ -814,7 +840,7 @@ class _PodcastEpisodeCard(QFrame):
 
         if a1.type() == QEvent.Type.MouseButtonPress:
             mouse_event = cast(QMouseEvent, a1)
-            if a0 in (self._remove_btn, self._more_btn):
+            if a0 is self._more_btn:
                 return super().eventFilter(a0, a1)
             if mouse_event.button() == Qt.MouseButton.LeftButton:
                 self.clicked.emit(self._row_index, mouse_event.modifiers())
@@ -885,6 +911,8 @@ class _PodcastEpisodeList(QFrame):
 
         self._expanded_keys: set[str] = set()
         self._selected_rows: set[int] = set()
+        self._selection_anchor: int | None = None
+        self._selection_was_active = False
         self._row_heights: list[int] = []
         self._row_offsets: list[int] = [0]
         self._expanded_text_cache: dict[tuple[str, int], tuple[str, int]] = {}
@@ -904,6 +932,7 @@ class _PodcastEpisodeList(QFrame):
         self._content = _PodcastEpisodeContent()
         self.table.setWidget(self._content)
         self.table.customContextMenuRequested.connect(owner._on_episode_context_menu)
+        self.table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout.addWidget(self.table)
 
         bar = self.table.verticalScrollBar()
@@ -915,6 +944,11 @@ class _PodcastEpisodeList(QFrame):
         return _PodcastEpisodeList(owner)
 
     def set_rows(self, rows: list[dict], columns: list[str]) -> None:
+        # Carry the selection across by identity, not by position. Row indices
+        # shift whenever the list is re-sorted, filtered, or shrunk by a
+        # removal, and reusing them would silently reselect other episodes.
+        previously_selected = self.selected_keys()
+
         self._columns = columns.copy()
         self._all_tracks = rows
         self._tracks = rows
@@ -924,8 +958,12 @@ class _PodcastEpisodeList(QFrame):
         valid_keys = {self._row_key(row) for row in rows}
         self._expanded_keys.intersection_update(valid_keys)
         self._selected_rows = {
-            row for row in self._selected_rows if 0 <= row < len(rows)
+            index
+            for index, row in enumerate(rows)
+            if self._row_key(row) in previously_selected
         }
+        self._selection_anchor = None
+        self._selection_was_active = bool(self._selected_rows)
         self._expanded_text_cache.clear()
         self._requested_artwork_sources.clear()
         self._rebuild_heights()
@@ -946,11 +984,23 @@ class _PodcastEpisodeList(QFrame):
     def selected_rows(self) -> list[int]:
         return sorted(row for row in self._selected_rows if row < len(self._tracks))
 
+    def selected_keys(self) -> set[str]:
+        """Stable identities of the selected rows, safe across re-sorts."""
+        return {
+            self._row_key(self._tracks[row])
+            for row in self._selected_rows
+            if 0 <= row < len(self._tracks)
+        }
+
+    def row_count(self) -> int:
+        return len(self._tracks)
+
     def clear_selection(self) -> None:
         if not self._selected_rows:
             return
         old_rows = set(self._selected_rows)
         self._selected_rows.clear()
+        self._selection_anchor = None
         self._update_selection_for_rows(old_rows)
         self._notify_selection_changed()
 
@@ -959,7 +1009,17 @@ class _PodcastEpisodeList(QFrame):
             return
         old_rows = set(self._selected_rows)
         self._selected_rows = {row}
+        self._selection_anchor = row
         self._update_selection_for_rows(old_rows | {row})
+        self._notify_selection_changed()
+
+    def select_all(self) -> None:
+        """Select every row currently listed, respecting any active filter."""
+        if not self._tracks:
+            return
+        old_rows = set(self._selected_rows)
+        self._selected_rows = set(range(len(self._tracks)))
+        self._update_selection_for_rows(old_rows | self._selected_rows)
         self._notify_selection_changed()
 
     def row_at_viewport_y(self, y: int) -> int:
@@ -1133,9 +1193,7 @@ class _PodcastEpisodeList(QFrame):
         widget = _PodcastEpisodeCard(self._content)
         widget.clicked.connect(self._on_card_clicked)
         widget.more_requested.connect(self._toggle_expanded)
-        remove_handler = getattr(self._owner, "_on_episode_card_remove_from_ipod", None)
-        if callable(remove_handler):
-            widget.remove_requested.connect(remove_handler)
+        widget.check_toggled.connect(self._on_card_check_toggled)
         widget.context_requested.connect(self._on_card_context_menu)
         return widget
 
@@ -1171,6 +1229,7 @@ class _PodcastEpisodeList(QFrame):
             row=row,
             row_key=key,
             selected=row_index in self._selected_rows,
+            selection_active=bool(self._selected_rows),
             expanded=expanded,
             description_text=description_text,
             show_more=show_more or expanded,
@@ -1219,22 +1278,49 @@ class _PodcastEpisodeList(QFrame):
         row_index: int,
         modifiers: Qt.KeyboardModifier,
     ) -> None:
+        """Platform-standard click semantics for the card body.
+
+        Plain click selects one row rather than accumulating a batch: with a
+        destructive action in the batch bar, an idle click must never quietly
+        grow the set of episodes about to be removed. Batches are built with
+        the per-card checkbox, or with the usual modifiers.
+        """
         if not (0 <= row_index < len(self._tracks)):
             return
+
         old_rows = set(self._selected_rows)
         shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
-        if shift and self._selected_rows:
-            anchor = min(self._selected_rows)
-            lo, hi = sorted((anchor, row_index))
-            self._selected_rows |= set(range(lo, hi + 1))
-        else:
-            # Plain click toggles, so batches can be built without modifiers.
-            # Ctrl/Cmd behaves the same rather than being a second way in.
+        toggle = bool(
+            modifiers
+            & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)
+        )
+
+        if shift and self._selection_anchor is not None:
+            lo, hi = sorted((self._selection_anchor, row_index))
+            self._selected_rows = set(range(lo, hi + 1))
+        elif toggle:
             if row_index in self._selected_rows:
                 self._selected_rows.remove(row_index)
             else:
                 self._selected_rows.add(row_index)
+            self._selection_anchor = row_index
+        else:
+            self._selected_rows = {row_index}
+            self._selection_anchor = row_index
+
         self._update_selection_for_rows(old_rows | self._selected_rows)
+        self._notify_selection_changed()
+
+    def _on_card_check_toggled(self, row_index: int, checked: bool) -> None:
+        """Checkbox clicks touch exactly one row and nothing else."""
+        if not (0 <= row_index < len(self._tracks)):
+            return
+        if checked:
+            self._selected_rows.add(row_index)
+        else:
+            self._selected_rows.discard(row_index)
+        self._selection_anchor = row_index
+        self._update_selection_for_rows({row_index})
         self._notify_selection_changed()
 
     def _on_card_context_menu(self, row_index: int, pos: QPoint) -> None:
@@ -1248,6 +1334,13 @@ class _PodcastEpisodeList(QFrame):
         self.table.customContextMenuRequested.emit(viewport_pos)
 
     def _update_selection_for_rows(self, rows: set[int]) -> None:
+        # Whether *any* row is selected drives checkbox visibility on every
+        # card, so crossing that boundary has to rebind the whole viewport.
+        active = bool(self._selected_rows)
+        if active != self._selection_was_active:
+            self._selection_was_active = active
+            rows = set(self._visible_widgets) | rows
+
         for row in rows:
             widget = self._visible_widgets.get(row)
             if widget is not None and 0 <= row < len(self._tracks):
@@ -1256,6 +1349,35 @@ class _PodcastEpisodeList(QFrame):
     def _recycle_all_visible_widgets(self) -> None:
         for row_index in list(self._visible_widgets):
             self._release_widget(row_index)
+
+    def keyPressEvent(self, a0: QKeyEvent | None) -> None:
+        """Standard selection keys for a multi-select list."""
+        if a0 is None:
+            super().keyPressEvent(a0)
+            return
+
+        key = a0.key()
+        select_all = bool(
+            a0.modifiers()
+            & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)
+        ) and key == Qt.Key.Key_A
+
+        if select_all:
+            self.select_all()
+            a0.accept()
+            return
+        if key == Qt.Key.Key_Escape and self._selected_rows:
+            self.clear_selection()
+            a0.accept()
+            return
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self._selected_rows:
+            handler = getattr(self._owner, "_on_remove_episode_selection", None)
+            if callable(handler):
+                handler()
+                a0.accept()
+                return
+
+        super().keyPressEvent(a0)
 
 
 # ── Feed artwork cache ───────────────────────────────────────────────────────
@@ -1288,13 +1410,19 @@ class PodcastBrowser(QFrame):
         self._ipod_path: str = ""
         self._store = None          # SubscriptionStore (lazy)
         self._selected_feed = None  # Current PodcastFeed
-        self._showing_combined_feed = False
+        self._view_mode = _VIEW_SHOW
         self._deferred_reconcile_tracks: list[dict] | None = None
         self._episode_by_guid: dict[str, object] = {}
         self._episode_feed_by_key: dict[str, object] = {}
         self._episode_dicts: list[dict] = []
         self._artwork_inflight: dict[str, list[Callable[[str, QPixmap], None]]] = {}
         self._episode_state_retry: Callable[[], None] | None = None
+        self._on_ipod_sort = _SORT_NEWEST
+        self._on_ipod_query = ""
+        self._on_ipod_search_timer = QTimer(self)
+        self._on_ipod_search_timer.setSingleShot(True)
+        self._on_ipod_search_timer.setInterval(_SEARCH_DEBOUNCE_MS)
+        self._on_ipod_search_timer.timeout.connect(self._apply_on_ipod_search)
         self._status_clear_text = ""
         self._status_clear_timer = QTimer(self)
         self._status_clear_timer.setSingleShot(True)
@@ -1313,6 +1441,47 @@ class PodcastBrowser(QFrame):
             return self._library_cache.get_tracks() or []
         except Exception:
             return None
+
+    # ── Current view ─────────────────────────────────────────────────────
+
+    @property
+    def _showing_combined_feed(self) -> bool:
+        """True while the plain chronological feed of all shows is visible."""
+        return self._view_mode == _VIEW_FEED
+
+    @property
+    def _showing_on_ipod(self) -> bool:
+        """True while the device-truth "On iPod" view is visible."""
+        return self._view_mode == _VIEW_ON_IPOD
+
+    def _current_view_key(self) -> str:
+        """The feed-list ``UserRole`` key identifying the visible view."""
+        if self._view_mode == _VIEW_FEED:
+            return _COMBINED_FEED_KEY
+        if self._view_mode == _VIEW_ON_IPOD:
+            return _ON_IPOD_KEY
+        return getattr(self._selected_feed, "feed_url", "") or ""
+
+    def _refresh_current_view(self) -> None:
+        """Re-render whichever episode view is active.
+
+        Every status change — reconciliation, RSS refresh, listened toggles,
+        download removal, post-sync refresh — routes through here so a newly
+        added view can never be missed by one of those call sites.
+        """
+        if self._view_mode == _VIEW_ON_IPOD:
+            self._show_on_ipod_episodes()
+            return
+        if self._view_mode == _VIEW_FEED:
+            self._show_combined_feed()
+            return
+        if self._selected_feed is None:
+            return
+        if self._store is not None:
+            refreshed = self._store.get_feed(self._selected_feed.feed_url)
+            if refreshed is not None:
+                self._selected_feed = refreshed
+        self._show_episodes(self._selected_feed)
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -1395,12 +1564,22 @@ class PodcastBrowser(QFrame):
 
         self._store = None
         self._selected_feed = None
-        self._showing_combined_feed = False
+        self._view_mode = _VIEW_SHOW
         self._deferred_reconcile_tracks = None
         self._episode_by_guid.clear()
         self._episode_feed_by_key.clear()
         if hasattr(self, '_session_refreshed'):
             self._session_refreshed.clear()
+
+        # A filter left over from the previous iPod would silently hide rows
+        # on the next one, with no visible cause.
+        self._on_ipod_search_timer.stop()
+        self._on_ipod_query = ""
+        self._on_ipod_search.blockSignals(True)
+        self._on_ipod_search.clear()
+        self._on_ipod_search.blockSignals(False)
+        self._library_header.hide()
+
         self._feed_list.clear()
         self._episode_list.set_rows([], _PODCAST_EPISODE_COLUMNS)
         self._episode_dicts = []
@@ -1469,14 +1648,7 @@ class PodcastBrowser(QFrame):
             ):
                 return
 
-        if self._selected_feed:
-            refreshed = store.get_feed(self._selected_feed.feed_url)
-            if refreshed:
-                self._selected_feed = refreshed
-        if self._showing_combined_feed:
-            self._show_combined_feed()
-        elif self._selected_feed:
-            self._show_episodes(self._selected_feed)
+        self._refresh_current_view()
 
     # ── UI construction ──────────────────────────────────────────────────
 
@@ -1631,8 +1803,10 @@ class PodcastBrowser(QFrame):
         return splitter
 
     def _build_feed_panel(self) -> QWidget:
+        # "Subscriptions" no longer covers it: the pane leads with library
+        # views that are not subscriptions.
         panel = BrowserPane(
-            "Subscriptions",
+            "Podcasts",
             min_width=220,
             body_margins=(8, 2, 8, 8),
         )
@@ -1824,6 +1998,7 @@ class PodcastBrowser(QFrame):
         hdr_layout.addWidget(settings_strip)
 
         layout.addWidget(self._feed_header)
+        layout.addWidget(self._build_library_header())
 
         # ── Episode list ────────────────────────────────────────────────
         self._episode_list = _PodcastEpisodeList.build(self)
@@ -1851,6 +2026,17 @@ class PodcastBrowser(QFrame):
         selection_lay.setContentsMargins(12, 0, 12, 0)
         selection_lay.setSpacing(8)
 
+        # Master checkbox: reflects the whole visible list and drives it.
+        self._selection_master = QCheckBox()
+        self._selection_master.setObjectName("podcastSelectionMaster")
+        self._selection_master.setStyleSheet(checkbox_css(Metrics.FONT_SM))
+        self._selection_master.setTristate(True)
+        self._selection_master.setAccessibleName("Select all listed episodes")
+        self._selection_master.setToolTip("Select or deselect every listed episode")
+        self._selection_master.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._selection_master.clicked.connect(self._on_selection_master_clicked)
+        selection_lay.addWidget(self._selection_master)
+
         self._selection_count_label = make_label(
             "",
             size=Metrics.FONT_SM,
@@ -1865,6 +2051,21 @@ class PodcastBrowser(QFrame):
         self._selection_clear_btn.setFixedHeight(28)
         self._selection_clear_btn.clicked.connect(self._episode_list.clear_selection)
         selection_lay.addWidget(self._selection_clear_btn)
+
+        # Destructive action sits left of the primary and is never the default
+        # button, so Return can only ever trigger the additive one.
+        self._selection_remove_btn = QPushButton("Remove from iPod")
+        self._selection_remove_btn.setFont(
+            QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold)
+        )
+        self._selection_remove_btn.setStyleSheet(danger_btn_css("sm"))
+        self._selection_remove_btn.setFixedHeight(28)
+        self._selection_remove_btn.setAutoDefault(False)
+        self._selection_remove_btn.setDefault(False)
+        self._selection_remove_btn.clicked.connect(
+            self._on_remove_episode_selection
+        )
+        selection_lay.addWidget(self._selection_remove_btn)
 
         self._selection_apply_btn = QPushButton("Add to iPod")
         self._selection_apply_btn.setFont(
@@ -1906,6 +2107,95 @@ class PodcastBrowser(QFrame):
 
         return panel
 
+    def _build_library_header(self) -> QWidget:
+        """Header for the On iPod view: what is stored, and how to sift it.
+
+        Occupies the same slot as the per-show hero header; exactly one of the
+        two is visible at a time.
+        """
+        header = QFrame()
+        header.setObjectName("podcastLibraryHeader")
+        header.setStyleSheet(f"""
+            QFrame#podcastLibraryHeader {{
+                background: {paint_css('canvas.default')};
+                border-bottom: 1px solid {paint_css('border.subtle')};
+            }}
+        """)
+
+        layout = QVBoxLayout(header)
+        layout.setContentsMargins(24, 14, 24, 12)
+        layout.setSpacing(6)
+
+        title = make_label(
+            "On iPod",
+            size=Metrics.FONT_PAGE_TITLE,
+            weight=QFont.Weight.DemiBold,
+        )
+        layout.addWidget(title)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+
+        self._on_ipod_stats_label = make_label(
+            "",
+            size=Metrics.FONT_SM,
+            style=LABEL_SECONDARY(),
+        )
+        controls.addWidget(self._on_ipod_stats_label)
+        controls.addStretch()
+
+        self._on_ipod_select_all_btn = QPushButton("Select All")
+        self._on_ipod_select_all_btn.setFont(
+            QFont(FONT_FAMILY, Metrics.FONT_SM, QFont.Weight.DemiBold)
+        )
+        self._on_ipod_select_all_btn.setStyleSheet(
+            btn_css(radius=Metrics.BORDER_RADIUS_SM, padding="0px 12px")
+        )
+        self._on_ipod_select_all_btn.setFixedHeight(BROWSER_SEARCH_CONTROL_SIZE)
+        self._on_ipod_select_all_btn.setToolTip(
+            "Select every episode currently listed"
+        )
+        self._on_ipod_select_all_btn.clicked.connect(self._select_all_visible)
+        controls.addWidget(self._on_ipod_select_all_btn)
+
+        self._on_ipod_sort_combo = QComboBox()
+        self._on_ipod_sort_combo.addItems(list(_ON_IPOD_SORT_LABELS))
+        self._on_ipod_sort_combo.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
+        self._on_ipod_sort_combo.setStyleSheet(combo_css())
+        self._on_ipod_sort_combo.setFixedHeight(BROWSER_SEARCH_CONTROL_SIZE)
+        self._on_ipod_sort_combo.setAccessibleName("Sort episodes on iPod")
+        self._on_ipod_sort_combo.setToolTip("Change how the list is ordered")
+        self._on_ipod_sort_combo.currentTextChanged.connect(
+            self._on_ipod_sort_changed
+        )
+        controls.addWidget(self._on_ipod_sort_combo)
+
+        self._on_ipod_search = QLineEdit()
+        self._on_ipod_search.setObjectName("podcastOnIpodSearchField")
+        self._on_ipod_search.setPlaceholderText("Find on iPod")
+        self._on_ipod_search.setAccessibleName("Search episodes on iPod")
+        self._on_ipod_search.setToolTip("Filter by episode title or show name")
+        self._on_ipod_search.setClearButtonEnabled(True)
+        self._on_ipod_search.setFixedSize(
+            BROWSER_SEARCH_FIELD_WIDTH,
+            BROWSER_SEARCH_CONTROL_SIZE,
+        )
+        self._on_ipod_search.setStyleSheet(browser_search_field_css())
+        search_icon = glyph_icon("search", 16, paint_css("text.tertiary"))
+        if search_icon is not None:
+            self._on_ipod_search.addAction(
+                search_icon,
+                QLineEdit.ActionPosition.LeadingPosition,
+            )
+        self._on_ipod_search.textChanged.connect(self._on_ipod_search_typed)
+        controls.addWidget(self._on_ipod_search)
+
+        layout.addLayout(controls)
+
+        self._library_header = header
+        header.hide()
+        return header
+
     # ── Episode state visuals ───────────────────────────────────────────
 
     def _show_episode_content(self) -> None:
@@ -1918,9 +2208,15 @@ class PodcastBrowser(QFrame):
         self._episode_state.show_loading(title, message)
         self._episode_stack.setCurrentIndex(1)
 
-    def _show_episode_empty(self, title: str, message: str) -> None:
+    def _show_episode_empty(
+        self,
+        title: str,
+        message: str,
+        *,
+        glyph: str = "broadcast",
+    ) -> None:
         self._episode_state_retry = None
-        self._episode_state.show_empty(title, message)
+        self._episode_state.show_empty(title, message, glyph=glyph)
         self._episode_stack.setCurrentIndex(1)
 
     def _show_episode_error(
@@ -1949,42 +2245,74 @@ class PodcastBrowser(QFrame):
 
     # ── Feed list management ─────────────────────────────────────────────
 
+    def _add_feed_section_header(self, text: str) -> None:
+        """Append an inert grouping label to the feed list."""
+        item = QListWidgetItem(text)
+        # No flags at all: the row cannot be selected, and Qt's arrow-key
+        # navigation steps straight over it.
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        item.setData(Qt.ItemDataRole.UserRole, "")
+        item.setFont(
+            QFont(FONT_FAMILY, Metrics.FONT_SIDEBAR_SECTION, QFont.Weight.DemiBold)
+        )
+        item.setForeground(_qcolor(paint_css("text.tertiary")))
+        item.setSizeHint(QSize(0, 26))
+        self._feed_list.addItem(item)
+
+    def _add_library_row(self, label: str, key: str, glyph: str) -> None:
+        """Append one of the synthetic library rows (Feed / On iPod)."""
+        item = QListWidgetItem(label)
+        item.setData(Qt.ItemDataRole.UserRole, key)
+        item.setSizeHint(QSize(0, 40))
+        tile = self._artwork_placeholder_pixmap(36, glyph=glyph)
+        if tile:
+            item.setIcon(QIcon(tile))
+        self._feed_list.addItem(item)
+
+    def _row_for_key(self, key: str) -> int:
+        """Find a feed-list row by its ``UserRole`` key, or -1."""
+        if not key:
+            return -1
+        for row in range(self._feed_list.count()):
+            item = self._feed_list.item(row)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == key:
+                return row
+        return -1
+
     def _refresh_feed_list(self) -> None:
         """Repopulate the feed list widget from the subscription store."""
         if not self._store:
             return
 
         self._feed_list.blockSignals(True)
-        prev_url = (
-            _COMBINED_FEED_KEY
-            if self._showing_combined_feed
-            else self._selected_feed.feed_url if self._selected_feed else None
-        )
+        prev_key = self._current_view_key()
         self._feed_list.clear()
 
         feeds = self._store.get_feeds()
+        on_ipod_count = self._on_ipod_episode_count()
 
-        # Show empty state or main content
-        if not feeds:
+        # The full-page "no subscriptions" pitch is only the truth when the
+        # iPod is also empty. Podcasts put there by iTunes still need a way in.
+        if not feeds and not on_ipod_count:
             self._stack.setCurrentIndex(0)
             self._feed_list.blockSignals(False)
             self._selected_feed = None
-            self._showing_combined_feed = False
+            self._view_mode = _VIEW_SHOW
             self._show_episodes(None)
             return
         self._stack.setCurrentIndex(1)
 
-        feed_item = QListWidgetItem("Feed")
-        feed_item.setData(Qt.ItemDataRole.UserRole, _COMBINED_FEED_KEY)
-        feed_item.setSizeHint(QSize(0, 40))
-        feed_icon = self._artwork_placeholder_pixmap(36)
-        if feed_icon:
-            feed_item.setIcon(QIcon(feed_icon))
-        self._feed_list.addItem(feed_item)
+        self._add_feed_section_header("Library")
+        self._add_library_row("Feed", _COMBINED_FEED_KEY, "broadcast")
+        self._add_library_row(
+            f"On iPod  ({on_ipod_count})",
+            _ON_IPOD_KEY,
+            "download",
+        )
+        if feeds:
+            self._add_feed_section_header("Shows")
 
-        select_row = 0 if prev_url in (None, _COMBINED_FEED_KEY) else -1
-
-        for i, feed in enumerate(feeds):
+        for feed in feeds:
             ep_count = len(feed.episodes)
             label = feed.title or "Untitled"
             item = QListWidgetItem(f"{label}  ({ep_count})")
@@ -2005,27 +2333,30 @@ class PodcastBrowser(QFrame):
                 )
                 item.setIcon(QIcon(icon_pm))
             elif artwork_source:
-                self._load_feed_list_artwork(artwork_source, i + 1)
+                self._load_feed_list_artwork(artwork_source)
 
             self._feed_list.addItem(item)
-            if feed.feed_url == prev_url:
-                select_row = i + 1
 
         self._feed_list.blockSignals(False)
 
+        select_row = self._row_for_key(prev_key)
+        if select_row < 0:
+            # With no subscriptions there is nothing for Feed to show, so open
+            # on the one view that has content.
+            select_row = self._row_for_key(
+                _COMBINED_FEED_KEY if feeds else _ON_IPOD_KEY
+            )
         if select_row >= 0:
             self._feed_list.setCurrentRow(select_row)
-        elif self._feed_list.count() > 0:
-            self._feed_list.setCurrentRow(0)
         else:
             self._selected_feed = None
-            self._showing_combined_feed = False
+            self._view_mode = _VIEW_SHOW
             self._show_episodes(None)
 
     def _on_feed_selected(self, row: int) -> None:
         if row < 0 or not self._store:
             self._selected_feed = None
-            self._showing_combined_feed = False
+            self._view_mode = _VIEW_SHOW
             self._show_episodes(None)
             return
 
@@ -2034,14 +2365,21 @@ class PodcastBrowser(QFrame):
             return
 
         feed_url = item.data(Qt.ItemDataRole.UserRole)
+        if not feed_url:
+            return  # A section header — not selectable, but stay defensive.
         if feed_url == _COMBINED_FEED_KEY:
             self._selected_feed = None
-            self._showing_combined_feed = True
+            self._view_mode = _VIEW_FEED
             self._show_combined_feed()
+            return
+        if feed_url == _ON_IPOD_KEY:
+            self._selected_feed = None
+            self._view_mode = _VIEW_ON_IPOD
+            self._show_on_ipod_episodes()
             return
 
         self._selected_feed = self._store.get_feed(feed_url)
-        self._showing_combined_feed = False
+        self._view_mode = _VIEW_SHOW
         self._show_episodes(self._selected_feed)
 
         # Auto-refresh from RSS if this feed only has persisted episodes
@@ -2239,8 +2577,9 @@ class PodcastBrowser(QFrame):
             return
 
         self._selected_feed = None
-        self._showing_combined_feed = True
+        self._view_mode = _VIEW_FEED
         self._feed_header.hide()
+        self._library_header.hide()
         self._episode_by_guid.clear()
         self._episode_feed_by_key.clear()
 
@@ -2273,11 +2612,247 @@ class PodcastBrowser(QFrame):
                 "Subscribed shows will appear here after their feeds refresh.",
             )
 
+    # ── On iPod view ────────────────────────────────────────────────────
+
+    def _device_podcast_tracks(self) -> list[dict] | None:
+        """Podcast tracks actually present on the iPod, or None if unknown.
+
+        None means the iTunesDB has not finished parsing — distinct from an
+        empty list, which means the device genuinely holds no podcasts.
+        """
+        tracks = self._current_ipod_tracks()
+        if tracks is None:
+            return None
+        return [
+            track
+            for track in tracks
+            if _coerce_int(track.get("media_type")) & _PODCAST_MEDIA_TYPE_BIT
+        ]
+
+    def _on_ipod_episode_count(self) -> int:
+        """Count for the sidebar row.
+
+        Falls back to the subscription store's own tally while the device
+        database is still loading, so the row is never blank on first paint.
+        """
+        tracks = self._device_podcast_tracks()
+        if tracks is not None:
+            return len(tracks)
+        if self._store is None:
+            return 0
+        return sum(feed.on_ipod_count for feed in self._store.get_feeds())
+
+    def _orphan_feed_for(self, show_title: str, cache: dict) -> object:
+        """Return the placeholder feed grouping one unsubscribed show."""
+        from iopenpod.podcasts.models import PodcastFeed
+
+        title = show_title or "Unknown Podcast"
+        feed = cache.get(title)
+        if feed is None:
+            feed = PodcastFeed(
+                feed_url=f"{_ORPHAN_FEED_PREFIX}{title}",
+                title=title,
+            )
+            cache[title] = feed
+        return feed
+
+    def _build_on_ipod_rows(self, tracks: list[dict]) -> list[dict]:
+        """Build episode rows from the device's own podcast track list.
+
+        Tracks that match a subscribed episode render as that episode. Anything
+        else — podcasts put on the iPod by iTunes or another tool — is wrapped
+        in a throwaway episode so it is still visible and still removable.
+        """
+        from iopenpod.podcasts.models import (
+            STATUS_ON_IPOD,
+            PodcastEpisode,
+        )
+
+        subscribed: dict[int, tuple[object, object]] = {}
+        if self._store is not None:
+            for feed in self._store.get_feeds():
+                for ep in feed.episodes:
+                    if ep.status != STATUS_ON_IPOD:
+                        continue
+                    track_id = _coerce_int(getattr(ep, "ipod_db_track_id", 0))
+                    if track_id:
+                        subscribed[track_id] = (feed, ep)
+
+        orphan_feeds: dict[str, object] = {}
+        artwork_sources: dict[str, str] = {}
+        rows: list[dict] = []
+
+        for track in tracks:
+            track_id = _coerce_int(
+                track.get("db_track_id") or track.get("db_id")
+            )
+            match = subscribed.get(track_id) if track_id else None
+            if match is not None:
+                feed, ep = match
+            else:
+                feed = self._orphan_feed_for(
+                    str(track.get("Album") or ""),
+                    orphan_feeds,
+                )
+                ep = PodcastEpisode(
+                    guid=f"{_ORPHAN_FEED_PREFIX}{track_id}",
+                    title=str(track.get("Title") or "Untitled Episode"),
+                    description=str(track.get("Description Text") or ""),
+                    duration_seconds=_coerce_int(track.get("length")) // 1000,
+                    size_bytes=_coerce_int(track.get("size")),
+                    status=STATUS_ON_IPOD,
+                    ipod_db_track_id=track_id,
+                    play_count=_coerce_int(track.get("play_count_1")),
+                    last_played=_coerce_int(track.get("last_played")),
+                )
+
+            key = _episode_key(feed, ep)
+            self._episode_by_guid[key] = ep
+            self._episode_feed_by_key[key] = feed
+            feed_key = str(getattr(feed, "feed_url", "") or id(feed))
+            if feed_key not in artwork_sources:
+                artwork_sources[feed_key] = self._feed_artwork_source(feed)
+
+            row = self._ep_to_dict(ep, self._episode_status_display(ep)[0], feed)
+            row["_podcast_artwork_source"] = artwork_sources[feed_key]
+            # The device is authoritative for both of these. An RSS enclosure
+            # length can disagree with what was actually written, and "added to
+            # the iPod" is the date that matters when reclaiming space.
+            row["size"] = _coerce_int(track.get("size")) or row.get("size") or 0
+            row["date_added"] = _coerce_int(track.get("date_added"))
+            rows.append(row)
+
+        return rows
+
+    def _filtered_on_ipod_rows(self, rows: list[dict]) -> list[dict]:
+        """Apply the On iPod search box to *rows*."""
+        query = self._on_ipod_query.strip().lower()
+        if not query:
+            return rows
+        return [
+            row
+            for row in rows
+            if query in str(row.get("Title") or "").lower()
+            or query in str(row.get("podcast_feed_title") or "").lower()
+        ]
+
+    def _sorted_on_ipod_rows(self, rows: list[dict]) -> list[dict]:
+        """Apply the On iPod sort control to *rows*."""
+        mode = self._on_ipod_sort
+        if mode == _SORT_OLDEST:
+            return sorted(rows, key=lambda row: _coerce_int(row.get("date_added")))
+        if mode == _SORT_LARGEST:
+            return sorted(
+                rows,
+                key=lambda row: _coerce_int(row.get("size")),
+                reverse=True,
+            )
+        if mode == _SORT_SHOW:
+            return sorted(
+                rows,
+                key=lambda row: (
+                    str(row.get("podcast_feed_title") or "").lower(),
+                    -_coerce_int(row.get("date_added")),
+                ),
+            )
+        return sorted(
+            rows,
+            key=lambda row: _coerce_int(row.get("date_added")),
+            reverse=True,
+        )
+
+    def _update_on_ipod_stats(
+        self,
+        all_rows: list[dict],
+        visible_rows: list[dict],
+    ) -> None:
+        """Write the summary line above the On iPod list."""
+        filtering = len(visible_rows) != len(all_rows)
+        counted = visible_rows if filtering else all_rows
+        total_bytes = sum(_coerce_int(row.get("size")) for row in counted)
+        shows = {
+            str(row.get("podcast_feed_title") or "") for row in counted
+        }
+        shows.discard("")
+
+        if filtering:
+            episodes = f"{len(visible_rows)} of {len(all_rows)} episodes"
+        else:
+            count = len(all_rows)
+            episodes = f"{count} episode{'s' if count != 1 else ''}"
+
+        parts = [episodes]
+        if shows:
+            parts.append(f"{len(shows)} show{'s' if len(shows) != 1 else ''}")
+        if total_bytes > 0:
+            parts.append(format_size(total_bytes))
+        self._on_ipod_stats_label.setText("  ·  ".join(parts))
+
+    def _show_on_ipod_episodes(self) -> None:
+        """Show every podcast episode stored on the connected iPod."""
+        self._selected_feed = None
+        self._view_mode = _VIEW_ON_IPOD
+        self._feed_header.hide()
+        self._library_header.show()
+        self._episode_by_guid.clear()
+        self._episode_feed_by_key.clear()
+
+        tracks = self._device_podcast_tracks()
+        if tracks is None:
+            # The iTunesDB is still being read. Claiming "nothing on this iPod"
+            # here would be a lie the user has no way to distinguish.
+            self._episode_dicts = []
+            self._set_episode_rows([], _COMBINED_FEED_COLUMNS)
+            self._on_ipod_stats_label.setText("Reading the iPod…")
+            self._show_episode_loading(
+                "Reading the iPod…",
+                "Listing the podcast episodes stored on this iPod.",
+            )
+            return
+
+        all_rows = self._build_on_ipod_rows(tracks)
+        rows = self._sorted_on_ipod_rows(self._filtered_on_ipod_rows(all_rows))
+        self._update_on_ipod_stats(all_rows, rows)
+
+        self._episode_dicts = rows
+        self._set_episode_rows(rows, _COMBINED_FEED_COLUMNS)
+
+        if rows:
+            self._show_episode_content()
+        elif all_rows:
+            self._show_episode_empty(
+                "No matching episodes",
+                "No episode on this iPod matches your search.",
+                glyph="search",
+            )
+        else:
+            self._show_episode_empty(
+                "No podcasts on this iPod",
+                "Open a show, pick the episodes you want, and add them to "
+                "your iPod. They will be listed here.",
+                glyph="download",
+            )
+
+    def _on_ipod_sort_changed(self, label: str) -> None:
+        self._on_ipod_sort = _ON_IPOD_SORT_LABELS.get(label, _SORT_NEWEST)
+        if self._view_mode == _VIEW_ON_IPOD:
+            self._show_on_ipod_episodes()
+
+    def _on_ipod_search_typed(self, text: str) -> None:
+        self._on_ipod_query = text
+        self._on_ipod_search_timer.start()
+
+    def _apply_on_ipod_search(self) -> None:
+        if self._view_mode == _VIEW_ON_IPOD:
+            self._show_on_ipod_episodes()
+
     def _show_episodes(self, feed) -> None:
         """Populate the episode list for the given feed."""
         self._episode_by_guid.clear()
         self._episode_feed_by_key.clear()
         self._episode_dicts = []
+
+        self._library_header.hide()
 
         if not feed:
             self._feed_header.show()
@@ -2295,7 +2870,7 @@ class PodcastBrowser(QFrame):
             self._show_episode_content()
             return
 
-        self._showing_combined_feed = False
+        self._view_mode = _VIEW_SHOW
         self._feed_header.show()
         self._feed_title_label.setText(feed.title or "Untitled Podcast")
         self._feed_author_label.setText(feed.author or "Unknown Author")
@@ -2490,14 +3065,8 @@ class PodcastBrowser(QFrame):
 
         self._refresh_feed_list()
 
-        # Re-display the currently selected feed's episodes with full catalog
-        if self._showing_combined_feed and self._store:
-            self._show_combined_feed()
-        elif self._selected_feed and self._store:
-            updated = self._store.get_feed(self._selected_feed.feed_url)
-            if updated:
-                self._selected_feed = updated
-                self._show_episodes(updated)
+        # Re-display the current view's episodes with the full catalog
+        self._refresh_current_view()
 
         if failures:
             if count:
@@ -2597,13 +3166,7 @@ class PodcastBrowser(QFrame):
         # on disk was stale (e.g. NOT_DOWNLOADED episodes from RSS that
         # were synced but never persisted with ON_IPOD status).
         self.reconcile_ipod_statuses(ipod_tracks)
-        if self._showing_combined_feed:
-            self._show_combined_feed()
-        elif self._selected_feed:
-            updated = self._store.get_feed(self._selected_feed.feed_url)
-            if updated:
-                self._selected_feed = updated
-                self._show_episodes(updated)
+        self._refresh_current_view()
 
         from iopenpod.podcasts.podcast_sync import build_podcast_managed_plan
 
@@ -2704,15 +3267,13 @@ class PodcastBrowser(QFrame):
             return
         self._mark_feed_refreshed(feed.feed_url)
         self._set_status(f"Subscribed to {feed.title}")
-        self._showing_combined_feed = False
+        self._view_mode = _VIEW_SHOW
         self._refresh_feed_list()
 
         # Select the new feed
-        for i in range(self._feed_list.count()):
-            item = self._feed_list.item(i)
-            if item and item.data(Qt.ItemDataRole.UserRole) == feed.feed_url:
-                self._feed_list.setCurrentRow(i)
-                break
+        new_row = self._row_for_key(feed.feed_url)
+        if new_row >= 0:
+            self._feed_list.setCurrentRow(new_row)
 
         self._selected_feed = store.get_feed(feed.feed_url) or feed
         self._show_episodes(self._selected_feed)
@@ -2737,7 +3298,7 @@ class PodcastBrowser(QFrame):
             return
         self._set_status(f"Unsubscribed from {feed.title}")
         self._selected_feed = None
-        self._showing_combined_feed = False
+        self._view_mode = _VIEW_SHOW
         self._refresh_feed_list()
 
     def _refresh_single_feed(self, feed) -> None:
@@ -2774,23 +3335,18 @@ class PodcastBrowser(QFrame):
             return
         self._mark_feed_refreshed(feed.feed_url)
         self._set_status(f"Refreshed {feed.title}")
-        was_combined = self._showing_combined_feed
         self._refresh_feed_list()
 
-        # Re-display episodes for the selected feed — _refresh_feed_list
+        # Re-display episodes for the current view — _refresh_feed_list
         # restores the selection but setCurrentRow won't emit if the row
         # index didn't change, so the episode table wouldn't update.
-        if was_combined:
-            self._show_combined_feed()
-        elif self._selected_feed and self._selected_feed.feed_url == feed.feed_url:
-            self._selected_feed = feed
-            self._show_episodes(feed)
+        self._refresh_current_view()
 
     # ── Episode selection ────────────────────────────────────────────────
 
     def _get_selected_episode_refs(self):
         """Return list of (row, episode, feed) for selected episode rows."""
-        if not self._selected_feed and not self._showing_combined_feed:
+        if self._view_mode == _VIEW_SHOW and not self._selected_feed:
             return []
 
         result = []
@@ -2830,7 +3386,9 @@ class PodcastBrowser(QFrame):
                 continue
             _set_episode_listened(ep, listened)
             changed_count += 1
-            if feed is not None:
+            # Orphan podcasts have no subscription to write back to; letting
+            # their placeholder feed through would invent one on the iPod.
+            if feed is not None and not _is_synthetic_feed(feed):
                 changed_feeds[getattr(feed, "feed_url", str(id(feed)))] = cast(
                     "PodcastFeed",
                     feed,
@@ -2852,10 +3410,7 @@ class PodcastBrowser(QFrame):
             ):
                 return
 
-        if self._showing_combined_feed:
-            self._show_combined_feed()
-        else:
-            self._show_episodes(self._selected_feed)
+        self._refresh_current_view()
         self._refresh_feed_list()
 
         state = "listened" if listened else "unlistened"
@@ -2883,26 +3438,90 @@ class PodcastBrowser(QFrame):
         self._add_to_ipod_refs(selected)
 
     def _refresh_episode_selection_bar(self) -> None:
-        """Show the batch bar, and its counts, only while rows are selected."""
+        """Show the batch bar, and the actions the selection actually allows.
+
+        Each button carries its own count so a mixed selection is honest about
+        how it splits before anything is clicked.
+        """
         bar = getattr(self, "_selection_bar", None)
         if bar is None:
             return  # Called during construction, before the bar exists.
 
-        count = len(self._episode_list.selected_rows())
+        rows = self._episode_list.selected_rows()
+        count = len(rows)
         if not count:
             bar.hide()
             return
 
+        addable = 0
+        removable = 0
+        for row in rows:
+            if not (0 <= row < len(self._episode_dicts)):
+                continue
+            row_data = self._episode_dicts[row]
+            if row_data.get("_can_add_to_ipod"):
+                addable += 1
+            if row_data.get("_can_remove_from_ipod"):
+                removable += 1
+
         noun = "episode" if count == 1 else "episodes"
         self._selection_count_label.setText(f"{count} {noun} selected")
-        self._selection_apply_btn.setText(f"Add {count} to iPod")
+
+        # Hide rather than disable: a greyed button with no explanation reads
+        # as broken, and the bar only exists while something is selected.
+        self._selection_apply_btn.setVisible(addable > 0)
+        self._selection_apply_btn.setText(f"Add {addable} to iPod")
+        self._selection_remove_btn.setVisible(removable > 0)
+        self._selection_remove_btn.setText(f"Remove {removable} from iPod")
+
+        self._update_selection_master(count)
         bar.show()
+
+    def _update_selection_master(self, selected_count: int) -> None:
+        """Drive the tri-state master to match the visible selection."""
+        total = self._episode_list.row_count()
+        if selected_count and selected_count >= total:
+            state = Qt.CheckState.Checked
+        elif selected_count:
+            state = Qt.CheckState.PartiallyChecked
+        else:
+            state = Qt.CheckState.Unchecked
+        self._selection_master.blockSignals(True)
+        self._selection_master.setCheckState(state)
+        self._selection_master.blockSignals(False)
+
+    def _on_selection_master_clicked(self) -> None:
+        """Any click on the master resolves to all-or-nothing."""
+        rows = self._episode_list.selected_rows()
+        if len(rows) >= self._episode_list.row_count():
+            self._episode_list.clear_selection()
+        else:
+            self._episode_list.select_all()
+
+    def _select_all_visible(self) -> None:
+        """Select every listed episode, honouring an active search filter."""
+        self._episode_list.select_all()
 
     def _on_apply_episode_selection(self) -> None:
         refs = self._get_selected_episode_refs()
         if not refs:
             return
         self._add_to_ipod_refs(refs)
+
+    def _on_remove_episode_selection(self) -> None:
+        """Send every removable episode in the selection to Sync Review."""
+        from iopenpod.podcasts.models import STATUS_ON_IPOD
+
+        removable = [
+            (row, ep, feed)
+            for row, ep, feed in self._get_selected_episode_refs()
+            if getattr(ep, "status", "") == STATUS_ON_IPOD
+            and getattr(ep, "ipod_db_track_id", 0)
+        ]
+        if not removable:
+            self._set_action_status("No selected episode is on the iPod")
+            return
+        self._remove_from_ipod_refs(removable)
 
     def _add_to_ipod_refs(self, episode_refs: list) -> None:
         caps = self._device_sessions.current_session().capabilities
@@ -3013,7 +3632,7 @@ class PodcastBrowser(QFrame):
                     continue
             ep.downloaded_path = ""
             ep.status = STATUS_NOT_DOWNLOADED
-            if feed is not None:
+            if feed is not None and not _is_synthetic_feed(feed):
                 changed_feeds[getattr(feed, "feed_url", str(id(feed)))] = cast(
                     "PodcastFeed",
                     feed,
@@ -3027,10 +3646,7 @@ class PodcastBrowser(QFrame):
             ):
                 return
 
-        if self._showing_combined_feed:
-            self._show_combined_feed()
-        else:
-            self._show_episodes(self._selected_feed)
+        self._refresh_current_view()
         self._refresh_feed_list()
         if failures:
             failed_count = len(failures)
@@ -3067,12 +3683,6 @@ class PodcastBrowser(QFrame):
         self._remove_from_ipod_refs(
             [(0, ep, self._selected_feed) for ep in episodes]
         )
-
-    def _on_episode_card_remove_from_ipod(self, row_index: int) -> None:
-        ref = self._episode_ref_at_row(row_index)
-        if ref is None:
-            return
-        self._remove_from_ipod_refs([ref])
 
     def _remove_from_ipod_refs(self, episode_refs: list) -> None:
         """Build a sync plan to remove episode/feed refs from the iPod."""
@@ -3111,9 +3721,12 @@ class PodcastBrowser(QFrame):
             self._set_action_status("Episodes not found on iPod")
             return
 
+        # Sync Review is the confirmation step for this action, so name it
+        # rather than adding a second dialog on top of it.
         n = len(plan.to_remove)
         self._set_action_status(
-            f"Sending {n} removal{'s' if n != 1 else ''} to sync\u2026")
+            f"{n} removal{'s' if n != 1 else ''} sent to Sync Review"
+        )
         self.podcast_sync_requested.emit(plan)
 
     def refresh_episodes(self) -> None:
@@ -3122,16 +3735,8 @@ class PodcastBrowser(QFrame):
         Called after sync completes so status changes (e.g. 'on_ipod')
         are reflected in the UI.
         """
-        was_combined = self._showing_combined_feed
-        if self._selected_feed and self._store:
-            # Re-read the feed from store (statuses may have been updated)
-            refreshed = self._store.get_feed(self._selected_feed.feed_url)
-            if refreshed:
-                self._selected_feed = refreshed
-            self._show_episodes(self._selected_feed)
         self._refresh_feed_list()
-        if was_combined and self._store:
-            self._show_combined_feed()
+        self._refresh_current_view()
 
     # ── Artwork loading ──────────────────────────────────────────────────
 
@@ -3256,19 +3861,32 @@ class PodcastBrowser(QFrame):
             self._feed_art.setText("◎")
         self._reset_feed_hero_color()
 
-    def _artwork_placeholder_pixmap(self, size: int) -> QPixmap | None:
-        """Create the gray square placeholder used when artwork is missing."""
-        glyph = glyph_pixmap("broadcast", max(16, int(size * 0.52)), paint_css("text.tertiary"))
-        if glyph is None:
+    def _artwork_placeholder_pixmap(
+        self,
+        size: int,
+        *,
+        glyph: str = "broadcast",
+    ) -> QPixmap | None:
+        """Create the gray square tile used when artwork is missing.
+
+        The library rows reuse this tile with their own glyph so they read as
+        siblings of the real feed thumbnails beneath them.
+        """
+        glyph_px = glyph_pixmap(
+            glyph,
+            max(16, int(size * 0.52)),
+            paint_css("text.tertiary"),
+        )
+        if glyph_px is None:
             return None
 
         px = QPixmap(size, size)
         px.fill(QColor(paint_css("surface.inset")))
         painter = QPainter(px)
         try:
-            x = (size - glyph.width()) // 2
-            y = (size - glyph.height()) // 2
-            painter.drawPixmap(x, y, glyph)
+            x = (size - glyph_px.width()) // 2
+            y = (size - glyph_px.height()) // 2
+            painter.drawPixmap(x, y, glyph_px)
         finally:
             painter.end()
         return px
@@ -3437,9 +4055,8 @@ class PodcastBrowser(QFrame):
 
         self._request_artwork(source, _apply_if_selected)
 
-    def _load_feed_list_artwork(self, source: str, row: int) -> None:
+    def _load_feed_list_artwork(self, source: str) -> None:
         """Load a feed's artwork for its list item thumbnail."""
-        _ = row
         self._request_artwork(
             source,
             lambda loaded_source, full_pm: self._update_feed_list_icon(
@@ -3461,12 +4078,12 @@ class PodcastBrowser(QFrame):
             transform_mode=Qt.TransformationMode.SmoothTransformation,
         )
         icon = QIcon(icon_pm)
-        feeds = self._store.get_feeds()
-        for i, feed in enumerate(feeds):
-            if self._feed_artwork_source(feed) == url:
-                item = self._feed_list.item(i + 1)
-                if item:
-                    item.setIcon(icon)
+        for feed in self._store.get_feeds():
+            if self._feed_artwork_source(feed) != url:
+                continue
+            item = self._feed_list.item(self._row_for_key(feed.feed_url))
+            if item:
+                item.setIcon(icon)
 
     # ── Status helpers ───────────────────────────────────────────────────
 
