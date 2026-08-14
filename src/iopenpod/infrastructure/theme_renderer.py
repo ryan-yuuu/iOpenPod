@@ -15,6 +15,16 @@ from typing import Literal, Protocol
 
 PaintKind = Literal["opaque", "layer"]
 
+# WCAG 2.2 SC 1.4.11: the parts of a control that convey its boundary or state
+# need 3:1 against what they are drawn on. Accessibility preferences raise it to
+# the text floor, matching what the accent already does under high contrast.
+_CONTROL_BOUNDARY_RATIO = 3.0
+_HIGH_CONTRAST_CONTROL_RATIO = 4.5
+
+# A glyph inside a filled control is a small shape, so it is held to the text
+# floor against the fill it sits on rather than the control floor.
+_MARK_ON_FILL_RATIO = 4.5
+
 
 class ThemeInput(Protocol):
     """The catalog data required to render a theme without importing it."""
@@ -144,6 +154,43 @@ class Color:
         lighter = max(self.relative_luminance(), other.relative_luminance())
         darker = min(self.relative_luminance(), other.relative_luminance())
         return (lighter + 0.05) / (darker + 0.05)
+
+    def legible_over(self, backdrop: Color, minimum_ratio: float) -> Color:
+        """Preserve hue while making the smallest change that clears a floor.
+
+        ``normalized_for_contrast`` aims for the closest ratio to a target and
+        can settle just under it, which is right when the target is a look and
+        wrong when it is a guarantee. This keeps the color nearest the authored
+        one among those that actually meet *minimum_ratio*, so a theme is only
+        moved as far as legibility requires.
+        """
+
+        minimum_ratio = max(1.0, float(minimum_ratio))
+        if self.contrast_ratio(backdrop) >= minimum_ratio:
+            return self
+
+        hue, lightness, saturation = colorsys.rgb_to_hls(
+            self.red / 255.0,
+            self.green / 255.0,
+            self.blue / 255.0,
+        )
+        best: Color | None = None
+        best_distance = float("inf")
+        for step in range(256):
+            candidate_lightness = step / 255.0
+            red, green, blue = colorsys.hls_to_rgb(hue, candidate_lightness, saturation)
+            candidate = Color(_clamp_byte(red * 255), _clamp_byte(green * 255), _clamp_byte(blue * 255))
+            if candidate.contrast_ratio(backdrop) < minimum_ratio:
+                continue
+            distance = abs(candidate_lightness - lightness)
+            if distance < best_distance:
+                best = candidate
+                best_distance = distance
+        if best is None:
+            # Nothing on this hue can clear the floor against this backdrop, so
+            # fall back to the closest approach rather than pretending.
+            return self.normalized_for_contrast(backdrop, minimum_ratio)
+        return best
 
     def normalized_for_contrast(self, backdrop: Color, target_ratio: float) -> Color:
         """Preserve hue while finding the closest lightness at ``target_ratio``."""
@@ -539,7 +586,7 @@ def render_theme(
     _add_status_paints(paints, "INFO", is_dark, high_contrast)
     _add_effect_paints(paints, semantic, is_dark)
     _add_text_on_accent(paints, semantic, is_dark)
-    _add_application_paints(paints, is_dark=is_dark)
+    _add_application_paints(paints, is_dark=is_dark, high_contrast=high_contrast)
 
     return ResolvedTheme(
         theme_id=getattr(theme, "id", "custom"),
@@ -661,7 +708,12 @@ def _add_text_on_fill(paints: dict[str, Paint], name: str, fill_name: str) -> No
     )
 
 
-def _add_application_paints(paints: dict[str, Paint], *, is_dark: bool) -> None:
+def _add_application_paints(
+    paints: dict[str, Paint],
+    *,
+    is_dark: bool,
+    high_contrast: bool = False,
+) -> None:
     """Expose the renderer's stable application vocabulary.
 
     These are the paints new widgets should request. They are either authored
@@ -782,6 +834,7 @@ def _add_application_paints(paints: dict[str, Paint], *, is_dark: bool) -> None:
     _add_sync_review_category_paints(paints, is_dark=is_dark)
     _add_podcast_paints(paints)
     _add_grid_paints(paints)
+    _add_checkbox_paints(paints, high_contrast=high_contrast)
     _add_player_paints(paints, is_dark=is_dark)
 
     for name, source in {
@@ -827,6 +880,116 @@ def _add_composed_paint(
         layer.source_roles + backdrop.source_roles,
         backdrop_name,
     )
+
+
+_LEGIBILITY_PASSES = 4
+
+
+def _add_legible_paint(
+    paints: dict[str, Paint],
+    name: str,
+    source_name: str,
+    backdrops: tuple[str, ...],
+    target_ratio: float,
+) -> None:
+    """Add an opaque paint guaranteed to stand off *every* listed backdrop.
+
+    The authored color is kept whenever it already clears *target_ratio*; only
+    a color that would disappear is moved, and then only along its own hue, so
+    a theme keeps its character instead of being flattened to grey.
+
+    One control can be drawn on several surfaces — a checkbox appears on cards,
+    on raised bars, and on the canvas — and the widget has no way to know which
+    one it landed on. Rather than make it choose, the paint clears the floor on
+    all of them: lifting for one backdrop can spoil another, so the passes
+    repeat until the color holds everywhere.
+
+    This is for boundaries the user has to *see*; the outline of an empty
+    checkbox is the whole control when nothing is ticked. Decorative dividers
+    stay with the authored border roles.
+    """
+
+    source = paints[source_name]
+    if not source.is_opaque:
+        raise ValueError(f"{name} cannot be derived from transparent {source_name}")
+    backdrop_colors = []
+    for backdrop_name in backdrops:
+        backdrop = paints[backdrop_name]
+        if not backdrop.is_opaque:
+            raise ValueError(f"{backdrop_name} is not an opaque backdrop for {name}")
+        backdrop_colors.append(backdrop.color)
+
+    color = source.color
+    for _pass in range(_LEGIBILITY_PASSES):
+        short = [
+            backdrop
+            for backdrop in backdrop_colors
+            if color.contrast_ratio(backdrop) < target_ratio
+        ]
+        if not short:
+            break
+        for backdrop in short:
+            color = color.legible_over(backdrop, target_ratio)
+
+    primary = backdrops[0]
+    recipe = (
+        f"alias of {source_name}"
+        if color == source.color
+        else f"{source_name} moved to {target_ratio:.1f}:1 over {', '.join(backdrops)}"
+    )
+
+    paints[name] = Paint(
+        name,
+        color,
+        "opaque",
+        recipe,
+        source.source_roles + paints[primary].source_roles,
+        primary,
+    )
+
+
+# Where a checkbox can land. A row card and the batch bar above it are
+# different surfaces, and the same box is drawn on both.
+_CHECKBOX_BACKDROPS = ("SURFACE", "SURFACE_RAISED", "SURFACE_ALT", "BG_DARK")
+
+
+def _add_checkbox_paints(paints: dict[str, Paint], *, high_contrast: bool) -> None:
+    """Resolve the multi-select checkbox so every state reads on its surface.
+
+    An unticked box carries no fill of its own to speak of, which leaves its
+    outline doing all the work. That outline therefore gets the WCAG 1.4.11
+    floor for control boundaries, held against every surface the control is
+    drawn on, rather than the decorative border role it used to borrow — which
+    was chosen to sit quietly and did exactly that.
+    """
+
+    target = _HIGH_CONTRAST_CONTROL_RATIO if high_contrast else _CONTROL_BOUNDARY_RATIO
+
+    _add_opaque_alias(paints, "control.checkbox.fill", "SURFACE_ALT")
+    _add_legible_paint(paints, "control.checkbox.border", "BORDER", _CHECKBOX_BACKDROPS, target)
+    _add_opaque_alias(paints, "control.checkbox.hover_fill", "SURFACE_HOVER")
+    _add_legible_paint(paints, "control.checkbox.hover_border", "ACCENT", _CHECKBOX_BACKDROPS, target)
+    _add_legible_paint(paints, "control.checkbox.checked_fill", "ACCENT", _CHECKBOX_BACKDROPS, target)
+    _add_legible_paint(
+        paints,
+        "control.checkbox.checked_hover_fill",
+        "ACCENT_LIGHT",
+        _CHECKBOX_BACKDROPS,
+        target,
+    )
+    # The tick is drawn on the checked fill, not on the surface behind it.
+    _add_legible_paint(
+        paints,
+        "control.checkbox.mark",
+        "TEXT_ON_ACCENT",
+        ("control.checkbox.checked_fill",),
+        _MARK_ON_FILL_RATIO,
+    )
+    # Disabled boxes are exempt from the contrast floor by design: WCAG 1.4.11
+    # excludes inactive controls, and holding one at 3:1 would make it look
+    # available.
+    _add_opaque_alias(paints, "control.checkbox.disabled_fill", "SURFACE")
+    _add_opaque_alias(paints, "control.checkbox.disabled_border", "BORDER_SUBTLE")
 
 
 def _add_grid_paints(paints: dict[str, Paint]) -> None:

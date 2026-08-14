@@ -540,3 +540,27 @@ def test_remove_sits_left_of_the_primary_action(qtbot) -> None:
     assert order.index(browser._selection_remove_btn) < order.index(
         browser._selection_apply_btn
     )
+
+
+# ── The card's box says what the row's state is ─────────────────────────────
+
+
+def test_a_selected_row_shows_a_ticked_box(qtbot) -> None:
+    """The box and the row's selection are the same fact, shown twice.
+
+    The checkbox paints rely on this: an empty box is never drawn on the
+    accent-tinted fill of a selected card, so only the ticked and hovered
+    states are held to a contrast floor against that tint.
+    """
+
+    browser = _browser(qtbot)
+    _with_rows(browser)
+    _click(browser, 1)
+
+    browser._episode_list.schedule_viewport_refresh(force=True)
+    browser._episode_list._refresh_viewport()
+    card = browser._episode_list._visible_widgets.get(1)
+
+    assert card is not None
+    assert card._selected
+    assert card._check.isChecked()

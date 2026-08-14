@@ -30,6 +30,8 @@ from iopenpod.infrastructure.theme_catalog import load_theme_catalog
 from iopenpod.infrastructure.theme_renderer import Color, ResolvedTheme, render_theme
 from iopenpod.infrastructure.theme_runtime import ThemeRuntime
 
+from .glyphs import glyph_stylesheet_url
+
 if TYPE_CHECKING:
     from PyQt6.QtWidgets import QFrame, QLabel, QScrollArea, QWidget
 
@@ -1265,6 +1267,87 @@ def spin_css(
     """
 
 
+CHECKBOX_INDICATOR_SIZE = 20
+"""Space a checkbox indicator needs, border included.
+
+Widgets that constrain their checkbox must reserve this much or Qt clips the
+box: the indicator is drawn at ``_CHECKBOX_BOX_SIZE`` plus a 1px border on
+each side.
+"""
+
+_CHECKBOX_BOX_SIZE = CHECKBOX_INDICATOR_SIZE - 2
+_CHECKBOX_MARK_SIZE = 12
+
+
+def checkbox_indicator_css(selector: str = "QCheckBox") -> str:
+    """The check indicator, for any widget class that draws one.
+
+    Every state is carried by a renderer-owned paint held to a contrast floor
+    against the surfaces checkboxes sit on, and by a mark rather than fill
+    alone — an empty box, a tick, and a dash stay apart from each other when
+    color does not survive the trip to the user's screen.
+    """
+
+    mark = paint_css("control.checkbox.mark")
+    disabled_mark = paint_css("text.disabled")
+    checked_mark = glyph_stylesheet_url("check", _CHECKBOX_MARK_SIZE, mark)
+    partial_mark = glyph_stylesheet_url("minus", _CHECKBOX_MARK_SIZE, mark)
+    checked_off = glyph_stylesheet_url("check", _CHECKBOX_MARK_SIZE, disabled_mark)
+    partial_off = glyph_stylesheet_url("minus", _CHECKBOX_MARK_SIZE, disabled_mark)
+
+    def _image(url: str) -> str:
+        return f"image: {url};" if url else ""
+
+    return f"""
+        {selector}::indicator {{
+            width: {_CHECKBOX_BOX_SIZE}px;
+            height: {_CHECKBOX_BOX_SIZE}px;
+            border-radius: {(4)}px;
+            border: 1px solid {paint_css('control.checkbox.border')};
+            background: {paint_css('control.checkbox.fill')};
+        }}
+        {selector}::indicator:hover {{
+            border-color: {paint_css('control.checkbox.hover_border')};
+            background: {paint_css('control.checkbox.hover_fill')};
+        }}
+        {selector}::indicator:checked {{
+            background: {paint_css('control.checkbox.checked_fill')};
+            border-color: {paint_css('control.checkbox.checked_fill')};
+            {_image(checked_mark)}
+        }}
+        {selector}::indicator:checked:hover {{
+            background: {paint_css('control.checkbox.checked_hover_fill')};
+            border-color: {paint_css('control.checkbox.checked_hover_fill')};
+        }}
+        /* "Some, not all": the same accented box as checked, marked with a
+           dash, so a partial selection never reads as a full one — and never
+           changes size on its way between the two. */
+        {selector}::indicator:indeterminate {{
+            background: {paint_css('control.checkbox.checked_fill')};
+            border-color: {paint_css('control.checkbox.checked_fill')};
+            {_image(partial_mark)}
+        }}
+        {selector}::indicator:indeterminate:hover {{
+            background: {paint_css('control.checkbox.checked_hover_fill')};
+            border-color: {paint_css('control.checkbox.checked_hover_fill')};
+        }}
+        {selector}::indicator:disabled {{
+            background: {paint_css('control.checkbox.disabled_fill')};
+            border-color: {paint_css('control.checkbox.disabled_border')};
+        }}
+        {selector}::indicator:checked:disabled {{
+            background: {paint_css('control.checkbox.disabled_fill')};
+            border-color: {paint_css('control.checkbox.disabled_border')};
+            {_image(checked_off)}
+        }}
+        {selector}::indicator:indeterminate:disabled {{
+            background: {paint_css('control.checkbox.disabled_fill')};
+            border-color: {paint_css('control.checkbox.disabled_border')};
+            {_image(partial_off)}
+        }}
+    """
+
+
 def checkbox_css(font_size: int | None = None) -> str:
     """Standard checkbox stylesheet."""
     if font_size is None:
@@ -1278,38 +1361,7 @@ def checkbox_css(font_size: int | None = None) -> str:
             {font_size_rule}
             spacing: 8px;
         }}
-        QCheckBox::indicator {{
-            width: {(18)}px;
-            height: {(18)}px;
-            border-radius: {(4)}px;
-            border: 1px solid {paint_css('border.default')};
-            background: {paint_css('surface.inset')};
-        }}
-        QCheckBox::indicator:hover {{
-            border-color: {paint_css('focus.border')};
-            background: {paint_css('surface.hover')};
-        }}
-        QCheckBox::indicator:checked {{
-            background: {paint_css('control.primary.fill')};
-            border-color: {paint_css('control.primary.fill')};
-        }}
-        /* "Some, not all" for tri-state boxes: accented like checked, but
-           hollow, so a partial selection never reads as a full one. */
-        QCheckBox::indicator:indeterminate {{
-            background: {paint_css('surface.inset')};
-            border: 5px solid {paint_css('control.primary.fill')};
-        }}
-        QCheckBox::indicator:indeterminate:hover {{
-            border-color: {paint_css('control.primary.hover_fill')};
-        }}
-        QCheckBox::indicator:checked:hover {{
-            background: {paint_css('control.primary.hover_fill')};
-            border-color: {paint_css('control.primary.hover_fill')};
-        }}
-        QCheckBox::indicator:disabled {{
-            background: {paint_css('surface.default')};
-            border-color: {paint_css('border.subtle')};
-        }}
+        {checkbox_indicator_css('QCheckBox')}
     """
 
 
@@ -1536,29 +1588,7 @@ def table_css() -> str:
         QTableWidget::item:hover {{
             background-color: {paint_css('surface.hover')};
         }}
-        QTableView::indicator {{
-            width: 18px;
-            height: 18px;
-            border-radius: 4px;
-            border: 1px solid {paint_css('border.default')};
-            background: {paint_css('surface.inset')};
-        }}
-        QTableView::indicator:hover {{
-            border-color: {paint_css('focus.border')};
-            background: {paint_css('surface.hover')};
-        }}
-        QTableView::indicator:checked {{
-            background: {paint_css('control.primary.fill')};
-            border-color: {paint_css('control.primary.fill')};
-        }}
-        QTableView::indicator:checked:hover {{
-            background: {paint_css('control.primary.hover_fill')};
-            border-color: {paint_css('control.primary.hover_fill')};
-        }}
-        QTableView::indicator:disabled {{
-            background: {paint_css('surface.default')};
-            border-color: {paint_css('border.subtle')};
-        }}
+        {checkbox_indicator_css('QTableView')}
         QHeaderView::section {{
             background-color: {paint_css('surface.inset')};
             color: {paint_css('text.secondary')};
@@ -2058,27 +2088,5 @@ def app_stylesheet() -> str:
         background: transparent;
         spacing: 8px;
     }}
-    QCheckBox::indicator {{
-        width: {(18)}px;
-        height: {(18)}px;
-        border-radius: {(4)}px;
-        border: 1px solid {paint_css("border.default")};
-        background: {paint_css("surface.inset")};
-    }}
-    QCheckBox::indicator:hover {{
-        border-color: {paint_css("focus.border")};
-        background: {paint_css("surface.hover")};
-    }}
-    QCheckBox::indicator:checked {{
-        background: {paint_css("control.primary.fill")};
-        border-color: {paint_css("control.primary.fill")};
-    }}
-    QCheckBox::indicator:checked:hover {{
-        background: {paint_css("control.primary.hover_fill")};
-        border-color: {paint_css("control.primary.hover_fill")};
-    }}
-    QCheckBox::indicator:disabled {{
-        background: {paint_css("surface.default")};
-        border-color: {paint_css("border.subtle")};
-    }}
+    {checkbox_indicator_css("QCheckBox")}
 """

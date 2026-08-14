@@ -90,6 +90,7 @@ from ..glyphs import glyph_icon, glyph_pixmap
 from ..hidpi import scale_pixmap_for_display
 from ..styles import (
     BROWSER_SEARCH_CONTROL_SIZE,
+    CHECKBOX_INDICATOR_SIZE,
     FONT_FAMILY,
     LABEL_SECONDARY,
     Metrics,
@@ -364,7 +365,9 @@ _EPISODE_CARD_SPACING = 4
 _EPISODE_TOP_ROW_GAP = 10
 _EPISODE_TITLE_LABEL_GAP = 2
 _EPISODE_ACTION_ROW_HEIGHT = 24
-_EPISODE_CHECKBOX_SIZE = 18
+# Taken from the shared control so the card always reserves the whole box.
+# Anything smaller and Qt clips the indicator's border off.
+_EPISODE_CHECKBOX_SIZE = CHECKBOX_INDICATOR_SIZE
 _EPISODE_CHECKBOX_GAP = 10
 _EPISODE_DESC_COLLAPSED_LINES = 2
 _EPISODE_STATUS_MAX_WIDTH = 132
