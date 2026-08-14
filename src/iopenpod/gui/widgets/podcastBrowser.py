@@ -6,12 +6,17 @@ Layout:
     ├─────────────────┬────────────────────────────────────────────┤
     │  Feed list      │  Feed header (artwork · title · meta)     │
     │  (left panel)   ├────────────────────────────────────────────┤
-    │  ┌───────────┐  │  Episode table (row-select, right-click)  │
-    │  │ ▍art Feed │  │   Title        Duration   Date   Status   │
-    │  │ ▍art Feed │  │                                           │
-    │  └───────────┘  ├────────────────────────────────────────────┤
+    │  ┌───────────┐  │  Filter bar: count · [Sort ▾] · [Search]   │
+    │  │ ▍art Feed │  ├────────────────────────────────────────────┤
+    │  │ ▍art Feed │  │  Episode table (row-select, right-click)  │
+    │  └───────────┘  │   Title        Duration   Date   Status   │
+    │                 ├────────────────────────────────────────────┤
     │                 │  Action bar: [Add to iPod]                 │
     └─────────────────┴────────────────────────────────────────────┘
+
+    The right-hand panel serves three views — one show, the combined feed of
+    every subscription, and what is on the iPod. They share the episode list
+    and the filter bar above it; only the header swaps.
 
     When no feeds exist, a full-page empty state with a prominent CTA
     replaces the splitter.
@@ -48,11 +53,13 @@ from PyQt6.QtGui import (
     QIcon,
     QImage,
     QKeyEvent,
+    QKeySequence,
     QMouseEvent,
     QPainter,
     QPalette,
     QPixmap,
     QResizeEvent,
+    QShortcut,
 )
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -60,7 +67,6 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMenu,
@@ -77,18 +83,17 @@ from PyQt6.QtWidgets import (
 )
 
 from iopenpod.infrastructure.theme_renderer import render_content_hero_paints
+from iopenpod.search import SearchText, matches_search, prepare_search_text
 
 from ..artwork_rendering import dominant_artwork_color_from_pixmap
 from ..glyphs import glyph_icon, glyph_pixmap
 from ..hidpi import scale_pixmap_for_display
 from ..styles import (
     BROWSER_SEARCH_CONTROL_SIZE,
-    BROWSER_SEARCH_FIELD_WIDTH,
     FONT_FAMILY,
     LABEL_SECONDARY,
     Metrics,
     accent_btn_css,
-    browser_search_field_css,
     btn_css,
     checkbox_css,
     combo_css,
@@ -109,6 +114,7 @@ from .browserChrome import (
     style_browser_splitter,
 )
 from .formatters import format_size
+from .podcastEpisodeFilterBar import EpisodeFilterBar
 from .podcastStates import PodcastStatePanel
 
 log = logging.getLogger(__name__)
@@ -234,17 +240,110 @@ _PODCAST_MEDIA_TYPE_BIT = 0x04
 # never reach the subscription store — see _is_synthetic_feed().
 _ORPHAN_FEED_PREFIX = "__iopenpod_orphan__:"
 
-_SEARCH_DEBOUNCE_MS = 120
-
+# ── Episode ordering ─────────────────────────────────────────────────────────
 _SORT_NEWEST = "newest"
 _SORT_OLDEST = "oldest"
+_SORT_UNPLAYED = "unplayed"
+_SORT_LONGEST = "longest"
+_SORT_SHORTEST = "shortest"
 _SORT_LARGEST = "largest"
 _SORT_SHOW = "show"
-_ON_IPOD_SORT_LABELS = {
-    "Recently added": _SORT_NEWEST,
-    "Oldest first": _SORT_OLDEST,
-    "Largest first": _SORT_LARGEST,
-    "By show": _SORT_SHOW,
+_SORT_TITLE = "title"
+
+# Episodes whose feed never published a duration would otherwise lead
+# "Shortest first", claiming a length nobody knows.
+_UNKNOWN_DURATION = float("inf")
+
+
+def _row_date(row: dict) -> int:
+    return _coerce_int(row.get("date_added"))
+
+
+def _row_length(row: dict) -> int:
+    return _coerce_int(row.get("length"))
+
+
+def _row_size(row: dict) -> int:
+    return _coerce_int(row.get("size"))
+
+
+def _row_show(row: dict) -> str:
+    return str(row.get("podcast_feed_title") or "").casefold()
+
+
+def _row_title(row: dict) -> str:
+    return str(row.get("Title") or "").casefold()
+
+
+def _row_listened(row: dict) -> bool:
+    return bool(row.get("_was_listened"))
+
+
+def _row_search_text(row: dict) -> SearchText:
+    """The prepared text a search runs against: title, show, and blurb."""
+    prepared = row.get("_search_text")
+    if isinstance(prepared, SearchText):
+        return prepared
+    return prepare_search_text(
+        "\n".join(
+            str(row.get(key) or "")
+            for key in ("Title", "podcast_feed_title", "Description Text")
+        )
+    )
+
+
+# Every order ends on the title so that ties — same day, same length, same
+# show — keep a stable, readable sequence instead of feed order.
+_EPISODE_SORT_KEYS: dict[str, Callable[[dict], tuple[Any, ...]]] = {
+    _SORT_NEWEST: lambda row: (-_row_date(row), _row_title(row)),
+    _SORT_OLDEST: lambda row: (_row_date(row), _row_title(row)),
+    _SORT_UNPLAYED: lambda row: (_row_listened(row), -_row_date(row), _row_title(row)),
+    _SORT_LONGEST: lambda row: (-_row_length(row), _row_title(row)),
+    _SORT_SHORTEST: lambda row: (_row_length(row) or _UNKNOWN_DURATION, _row_title(row)),
+    _SORT_LARGEST: lambda row: (-_row_size(row), _row_title(row)),
+    _SORT_SHOW: lambda row: (_row_show(row), -_row_date(row), _row_title(row)),
+    _SORT_TITLE: lambda row: (_row_title(row), -_row_date(row)),
+}
+
+# Sort options per view, in menu order. Labels name the outcome rather than the
+# field, and the date labels differ because the date itself does: a show lists
+# publication dates, the iPod lists when a file landed on the device.
+_SHOW_SORT_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Newest first", _SORT_NEWEST),
+    ("Oldest first", _SORT_OLDEST),
+    ("Unplayed first", _SORT_UNPLAYED),
+    ("Longest first", _SORT_LONGEST),
+    ("Shortest first", _SORT_SHORTEST),
+    ("Title A–Z", _SORT_TITLE),
+)
+_FEED_SORT_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Newest first", _SORT_NEWEST),
+    ("Oldest first", _SORT_OLDEST),
+    ("Unplayed first", _SORT_UNPLAYED),
+    ("By show", _SORT_SHOW),
+    ("Longest first", _SORT_LONGEST),
+    ("Title A–Z", _SORT_TITLE),
+)
+_ON_IPOD_SORT_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("Recently added", _SORT_NEWEST),
+    ("Oldest first", _SORT_OLDEST),
+    ("Unplayed first", _SORT_UNPLAYED),
+    ("By show", _SORT_SHOW),
+    ("Largest first", _SORT_LARGEST),
+    ("Title A–Z", _SORT_TITLE),
+)
+_SORT_OPTIONS_BY_VIEW: dict[str, tuple[tuple[str, str], ...]] = {
+    _VIEW_SHOW: _SHOW_SORT_OPTIONS,
+    _VIEW_FEED: _FEED_SORT_OPTIONS,
+    _VIEW_ON_IPOD: _ON_IPOD_SORT_OPTIONS,
+}
+
+# What a search covers, per view: the field placeholder, then the longer
+# phrasing for the tooltip. The placeholder has to survive a 190px field.
+_SEARCH_SCOPE_BY_VIEW: dict[str, tuple[str, str]] = {
+    _VIEW_SHOW: ("Find in this show", "this show"),
+    _VIEW_FEED: ("Find an episode", "every subscribed episode"),
+    _VIEW_ON_IPOD: ("Find on iPod", "the episodes on this iPod"),
 }
 
 
@@ -1525,12 +1624,19 @@ class PodcastBrowser(QFrame):
         self._episode_dicts: list[dict] = []
         self._artwork_inflight: dict[str, list[Callable[[str, QPixmap], None]]] = {}
         self._episode_state_retry: Callable[[], None] | None = None
-        self._on_ipod_sort = _SORT_NEWEST
-        self._on_ipod_query = ""
-        self._on_ipod_search_timer = QTimer(self)
-        self._on_ipod_search_timer.setSingleShot(True)
-        self._on_ipod_search_timer.setInterval(_SEARCH_DEBOUNCE_MS)
-        self._on_ipod_search_timer.timeout.connect(self._apply_on_ipod_search)
+
+        # Everything the current view could list, before search and sort. Rows
+        # are built once per view change and re-presented from here, so typing
+        # never costs another read of the iPod or the subscription store.
+        self._episode_source_rows: list[dict] = []
+        self._episode_columns: list[str] = _PODCAST_EPISODE_COLUMNS.copy()
+        self._episode_empty_state = ("", "", "broadcast")
+        self._episode_query = ""
+        # The view the current query belongs to. A filter left behind on a
+        # different show would silently hide rows with no visible cause.
+        self._filtered_view_key = ""
+        self._sort_by_view: dict[str, str] = {}
+
         self._status_clear_text = ""
         self._status_clear_timer = QTimer(self)
         self._status_clear_timer.setSingleShot(True)
@@ -1681,11 +1787,7 @@ class PodcastBrowser(QFrame):
 
         # A filter left over from the previous iPod would silently hide rows
         # on the next one, with no visible cause.
-        self._on_ipod_search_timer.stop()
-        self._on_ipod_query = ""
-        self._on_ipod_search.blockSignals(True)
-        self._on_ipod_search.clear()
-        self._on_ipod_search.blockSignals(False)
+        self._reset_episode_filters()
         self._library_header.hide()
 
         self._feed_list.clear()
@@ -2108,6 +2210,19 @@ class PodcastBrowser(QFrame):
         layout.addWidget(self._feed_header)
         layout.addWidget(self._build_library_header())
 
+        # ── Sort and search ─────────────────────────────────────────────
+        # Directly above the list it acts on, and identical in every view.
+        self._filter_bar = EpisodeFilterBar()
+        self._filter_bar.sort_changed.connect(self._on_episode_sort_changed)
+        self._filter_bar.search_changed.connect(self._on_episode_search_changed)
+        self._filter_bar.search_dismissed.connect(self._focus_episode_list)
+        self._filter_bar.hide()
+        layout.addWidget(self._filter_bar)
+
+        find_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Find), self)
+        find_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        find_shortcut.activated.connect(self._focus_episode_search)
+
         # ── Episode list ────────────────────────────────────────────────
         self._episode_list = _PodcastEpisodeList.build(self)
         self._episode_stack = QStackedWidget()
@@ -2216,10 +2331,11 @@ class PodcastBrowser(QFrame):
         return panel
 
     def _build_library_header(self) -> QWidget:
-        """Header for the On iPod view: what is stored, and how to sift it.
+        """Title strip for the On iPod view.
 
         Occupies the same slot as the per-show hero header; exactly one of the
-        two is visible at a time.
+        two is visible at a time. Sorting and searching live in the shared
+        filter bar below, which serves every view.
         """
         header = QFrame()
         header.setObjectName("podcastLibraryHeader")
@@ -2230,9 +2346,9 @@ class PodcastBrowser(QFrame):
             }}
         """)
 
-        layout = QVBoxLayout(header)
+        layout = QHBoxLayout(header)
         layout.setContentsMargins(24, 14, 24, 12)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
         title = make_label(
             "On iPod",
@@ -2240,17 +2356,7 @@ class PodcastBrowser(QFrame):
             weight=QFont.Weight.DemiBold,
         )
         layout.addWidget(title)
-
-        controls = QHBoxLayout()
-        controls.setSpacing(8)
-
-        self._on_ipod_stats_label = make_label(
-            "",
-            size=Metrics.FONT_SM,
-            style=LABEL_SECONDARY(),
-        )
-        controls.addWidget(self._on_ipod_stats_label)
-        controls.addStretch()
+        layout.addStretch()
 
         self._on_ipod_select_all_btn = QPushButton("Select All")
         self._on_ipod_select_all_btn.setFont(
@@ -2264,41 +2370,7 @@ class PodcastBrowser(QFrame):
             "Select every episode currently listed"
         )
         self._on_ipod_select_all_btn.clicked.connect(self._select_all_visible)
-        controls.addWidget(self._on_ipod_select_all_btn)
-
-        self._on_ipod_sort_combo = QComboBox()
-        self._on_ipod_sort_combo.addItems(list(_ON_IPOD_SORT_LABELS))
-        self._on_ipod_sort_combo.setFont(QFont(FONT_FAMILY, Metrics.FONT_SM))
-        self._on_ipod_sort_combo.setStyleSheet(combo_css())
-        self._on_ipod_sort_combo.setFixedHeight(BROWSER_SEARCH_CONTROL_SIZE)
-        self._on_ipod_sort_combo.setAccessibleName("Sort episodes on iPod")
-        self._on_ipod_sort_combo.setToolTip("Change how the list is ordered")
-        self._on_ipod_sort_combo.currentTextChanged.connect(
-            self._on_ipod_sort_changed
-        )
-        controls.addWidget(self._on_ipod_sort_combo)
-
-        self._on_ipod_search = QLineEdit()
-        self._on_ipod_search.setObjectName("podcastOnIpodSearchField")
-        self._on_ipod_search.setPlaceholderText("Find on iPod")
-        self._on_ipod_search.setAccessibleName("Search episodes on iPod")
-        self._on_ipod_search.setToolTip("Filter by episode title or show name")
-        self._on_ipod_search.setClearButtonEnabled(True)
-        self._on_ipod_search.setFixedSize(
-            BROWSER_SEARCH_FIELD_WIDTH,
-            BROWSER_SEARCH_CONTROL_SIZE,
-        )
-        self._on_ipod_search.setStyleSheet(browser_search_field_css())
-        search_icon = glyph_icon("search", 16, paint_css("text.tertiary"))
-        if search_icon is not None:
-            self._on_ipod_search.addAction(
-                search_icon,
-                QLineEdit.ActionPosition.LeadingPosition,
-            )
-        self._on_ipod_search.textChanged.connect(self._on_ipod_search_typed)
-        controls.addWidget(self._on_ipod_search)
-
-        layout.addLayout(controls)
+        layout.addWidget(self._on_ipod_select_all_btn)
 
         self._library_header = header
         header.hide()
@@ -2322,9 +2394,16 @@ class PodcastBrowser(QFrame):
         message: str,
         *,
         glyph: str = "broadcast",
+        action_text: str = "",
+        action: Callable[[], None] | None = None,
     ) -> None:
-        self._episode_state_retry = None
-        self._episode_state.show_empty(title, message, glyph=glyph)
+        self._episode_state_retry = action
+        self._episode_state.show_empty(
+            title,
+            message,
+            glyph=glyph,
+            action_text=action_text if action is not None else "",
+        )
         self._episode_stack.setCurrentIndex(1)
 
     def _show_episode_error(
@@ -2654,10 +2733,13 @@ class PodcastBrowser(QFrame):
         status = str(getattr(ep, "status", ""))
         play_count = _coerce_int(getattr(ep, "play_count", 0))
         last_played = _coerce_int(getattr(ep, "last_played", 0))
+        title = ep.title or ep.guid or ""
+        show_title = getattr(feed, "title", "") if feed is not None else ""
+        description = _episode_description_text(ep.description)
         return {
-            "Title": ep.title or ep.guid or "",
-            "podcast_feed_title": getattr(feed, "title", "") if feed is not None else "",
-            "Description Text": _episode_description_text(ep.description),
+            "Title": title,
+            "podcast_feed_title": show_title,
+            "Description Text": description,
             "ep_status": status_text,
             "length": (ep.duration_seconds or 0) * 1000,
             "date_added": int(ep.pub_date or 0),
@@ -2666,6 +2748,11 @@ class PodcastBrowser(QFrame):
             "last_played": last_played,
             "_ep_guid": ep.guid,
             "_ep_key": ep_key,
+            # Prepared once per row rather than per keystroke: searching a big
+            # feed re-scans every episode on every character typed.
+            "_search_text": prepare_search_text(
+                "\n".join(part for part in (title, show_title, description) if part)
+            ),
             "_was_listened": _episode_is_listened(ep),
             "_listened_override": _episode_listened_override(ep),
             "_can_add_to_ipod": status not in (STATUS_ON_IPOD, STATUS_DOWNLOADING),
@@ -2678,47 +2765,205 @@ class PodcastBrowser(QFrame):
     def _set_episode_rows(self, rows: list[dict], columns: list[str]) -> None:
         self._episode_list.set_rows(rows, columns)
 
+    # ── Sort and search ──────────────────────────────────────────────────
+
+    def _begin_episode_view(self, view_mode: str) -> None:
+        """Arm the filter bar for the view about to be rendered.
+
+        The search resets when the user moves to a different show or library
+        view, but survives a re-render of the same one — status changes and
+        feed refreshes must not wipe what somebody is in the middle of typing.
+        The sort is remembered per view instead, since preferring newest-first
+        or by-show is a habit rather than a property of one show.
+        """
+        self._view_mode = view_mode
+
+        view_key = self._current_view_key()
+        if view_key != self._filtered_view_key:
+            self._filtered_view_key = view_key
+            self._episode_query = ""
+            self._filter_bar.set_query("")
+
+        placeholder, describes = _SEARCH_SCOPE_BY_VIEW[view_mode]
+        self._filter_bar.set_search_scope(placeholder, describes=describes)
+        # The bar reports what it could actually select: a view that does not
+        # offer the remembered order falls back, and must say so.
+        self._sort_by_view[view_mode] = self._filter_bar.set_sort_options(
+            _SORT_OPTIONS_BY_VIEW[view_mode],
+            self._sort_by_view.get(view_mode, _SORT_NEWEST),
+        )
+
+    def _set_episode_source_rows(
+        self,
+        rows: list[dict],
+        columns: list[str],
+        *,
+        empty_title: str,
+        empty_message: str,
+        empty_glyph: str = "broadcast",
+    ) -> None:
+        """Hand the view's full row set to the presenter and draw it."""
+        self._episode_source_rows = rows
+        self._episode_columns = columns
+        self._episode_empty_state = (empty_title, empty_message, empty_glyph)
+        self._present_episode_rows()
+
+    def _present_episode_rows(self) -> None:
+        """Draw the current view's rows through the active search and sort.
+
+        Searching and sorting re-present these rows rather than rebuilding
+        them, so a keystroke costs one filter pass instead of another read of
+        the iTunesDB or the subscription store.
+        """
+        source = self._episode_source_rows
+        rows = self._sorted_episode_rows(self._matching_episode_rows(source))
+
+        self._episode_dicts = rows
+        self._set_episode_rows(rows, self._episode_columns)
+        self._filter_bar.set_summary(self._episode_summary_text(source, rows))
+        # Controls with nothing to act on are noise; controls that hid every
+        # row must stay, or there is no way back to the full list.
+        self._filter_bar.setVisible(bool(source))
+
+        if rows:
+            self._show_episode_content()
+        elif source:
+            self._show_no_matching_episodes()
+        else:
+            title, message, glyph = self._episode_empty_state
+            self._show_episode_empty(title, message, glyph=glyph)
+
+    def _matching_episode_rows(self, rows: list[dict]) -> list[dict]:
+        """Keep the rows matching the search box, by title, show, or blurb."""
+        query = self._episode_query.strip()
+        if not query:
+            return rows
+        return [
+            row
+            for row in rows
+            # Every term has to land somewhere, so "mars rover" narrows instead
+            # of pulling in every episode that ever said "mars".
+            if matches_search(query, _row_search_text(row), match_all_terms=True)
+        ]
+
+    def _sorted_episode_rows(self, rows: list[dict]) -> list[dict]:
+        """Order rows by the sort chosen for the current view."""
+        sort_key = _EPISODE_SORT_KEYS.get(
+            self._sort_by_view.get(self._view_mode, _SORT_NEWEST),
+            _EPISODE_SORT_KEYS[_SORT_NEWEST],
+        )
+        return sorted(rows, key=sort_key)
+
+    def _episode_summary_text(
+        self,
+        source: list[dict],
+        visible: list[dict],
+    ) -> str:
+        """Describe what is listed, and what a search is holding back."""
+        filtering = len(visible) != len(source)
+        counted = visible if filtering else source
+
+        if filtering:
+            parts = [f"{len(visible)} of {len(source)} episodes"]
+        else:
+            count = len(source)
+            parts = [f"{count} episode{'s' if count != 1 else ''}"]
+
+        if self._view_mode != _VIEW_SHOW:
+            shows = {str(row.get("podcast_feed_title") or "") for row in counted}
+            shows.discard("")
+            if shows:
+                parts.append(f"{len(shows)} show{'s' if len(shows) != 1 else ''}")
+
+        # Only the device reports sizes it has actually written; an RSS
+        # enclosure length is a claim, and summing claims would mislead.
+        if self._view_mode == _VIEW_ON_IPOD:
+            total_bytes = sum(_row_size(row) for row in counted)
+            if total_bytes > 0:
+                parts.append(format_size(total_bytes))
+
+        return "  ·  ".join(parts)
+
+    def _show_no_matching_episodes(self) -> None:
+        """The list is empty because of the search, and says so."""
+        self._show_episode_empty(
+            "No matching episodes",
+            f"Nothing here matches “{self._episode_query.strip()}”.",
+            glyph="search",
+            action_text="Clear Search",
+            action=self._clear_episode_search,
+        )
+
+    def _on_episode_sort_changed(self, sort_key: str) -> None:
+        if not sort_key:
+            return
+        self._sort_by_view[self._view_mode] = sort_key
+        self._present_episode_rows()
+
+    def _on_episode_search_changed(self, text: str) -> None:
+        if text == self._episode_query:
+            return
+        self._episode_query = text
+        self._present_episode_rows()
+
+    def _clear_episode_search(self) -> None:
+        self._filter_bar.set_query("", notify=True)
+
+    def _focus_episode_search(self) -> None:
+        """Jump to the search box, unless this view has nothing to search."""
+        if self._filter_bar.isVisible():
+            self._filter_bar.focus_search()
+
+    def _focus_episode_list(self) -> None:
+        self._episode_list.table.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def _reset_episode_filters(self) -> None:
+        """Drop the query and the remembered orders, for a new device."""
+        self._episode_query = ""
+        self._filtered_view_key = ""
+        self._sort_by_view.clear()
+        self._episode_source_rows = []
+        self._filter_bar.set_query("")
+        self._filter_bar.set_summary("")
+        self._filter_bar.hide()
+
+    # ── Combined feed view ───────────────────────────────────────────────
+
     def _show_combined_feed(self) -> None:
-        """Show all subscribed episodes as one plain chronological feed."""
+        """Show every subscribed episode as one list across all shows."""
         if not self._store:
             self._show_episodes(None)
             return
 
         self._selected_feed = None
-        self._view_mode = _VIEW_FEED
+        self._begin_episode_view(_VIEW_FEED)
         self._feed_header.hide()
         self._library_header.hide()
         self._episode_by_guid.clear()
         self._episode_feed_by_key.clear()
 
-        episode_refs = []
-        for feed in self._store.get_feeds():
-            for ep in feed.episodes:
-                episode_refs.append((feed, ep))
-
-        episode_refs.sort(key=lambda ref: ref[1].pub_date or 0, reverse=True)
         rows = []
         artwork_sources: dict[str, str] = {}
-        for feed, ep in episode_refs:
-            key = _episode_key(feed, ep)
-            self._episode_by_guid[key] = ep
-            self._episode_feed_by_key[key] = feed
-            feed_key = str(getattr(feed, "feed_url", "") or id(feed))
-            if feed_key not in artwork_sources:
-                artwork_sources[feed_key] = self._feed_artwork_source(feed)
-            row = self._ep_to_dict(ep, self._episode_status_display(ep)[0], feed)
-            row["_podcast_artwork_source"] = artwork_sources[feed_key]
-            rows.append(row)
+        for feed in self._store.get_feeds():
+            for ep in feed.episodes:
+                key = _episode_key(feed, ep)
+                self._episode_by_guid[key] = ep
+                self._episode_feed_by_key[key] = feed
+                feed_key = str(getattr(feed, "feed_url", "") or id(feed))
+                if feed_key not in artwork_sources:
+                    artwork_sources[feed_key] = self._feed_artwork_source(feed)
+                row = self._ep_to_dict(ep, self._episode_status_display(ep)[0], feed)
+                row["_podcast_artwork_source"] = artwork_sources[feed_key]
+                rows.append(row)
 
-        self._episode_dicts = rows
-        self._set_episode_rows(rows, _COMBINED_FEED_COLUMNS)
-        if rows:
-            self._show_episode_content()
-        else:
-            self._show_episode_empty(
-                "Waiting for episodes",
-                "Subscribed shows will appear here after their feeds refresh.",
-            )
+        self._set_episode_source_rows(
+            rows,
+            _COMBINED_FEED_COLUMNS,
+            empty_title="Waiting for episodes",
+            empty_message=(
+                "Subscribed shows will appear here after their feeds refresh."
+            ),
+        )
 
     # ── On iPod view ────────────────────────────────────────────────────
 
@@ -2832,74 +3077,10 @@ class PodcastBrowser(QFrame):
 
         return rows
 
-    def _filtered_on_ipod_rows(self, rows: list[dict]) -> list[dict]:
-        """Apply the On iPod search box to *rows*."""
-        query = self._on_ipod_query.strip().lower()
-        if not query:
-            return rows
-        return [
-            row
-            for row in rows
-            if query in str(row.get("Title") or "").lower()
-            or query in str(row.get("podcast_feed_title") or "").lower()
-        ]
-
-    def _sorted_on_ipod_rows(self, rows: list[dict]) -> list[dict]:
-        """Apply the On iPod sort control to *rows*."""
-        mode = self._on_ipod_sort
-        if mode == _SORT_OLDEST:
-            return sorted(rows, key=lambda row: _coerce_int(row.get("date_added")))
-        if mode == _SORT_LARGEST:
-            return sorted(
-                rows,
-                key=lambda row: _coerce_int(row.get("size")),
-                reverse=True,
-            )
-        if mode == _SORT_SHOW:
-            return sorted(
-                rows,
-                key=lambda row: (
-                    str(row.get("podcast_feed_title") or "").lower(),
-                    -_coerce_int(row.get("date_added")),
-                ),
-            )
-        return sorted(
-            rows,
-            key=lambda row: _coerce_int(row.get("date_added")),
-            reverse=True,
-        )
-
-    def _update_on_ipod_stats(
-        self,
-        all_rows: list[dict],
-        visible_rows: list[dict],
-    ) -> None:
-        """Write the summary line above the On iPod list."""
-        filtering = len(visible_rows) != len(all_rows)
-        counted = visible_rows if filtering else all_rows
-        total_bytes = sum(_coerce_int(row.get("size")) for row in counted)
-        shows = {
-            str(row.get("podcast_feed_title") or "") for row in counted
-        }
-        shows.discard("")
-
-        if filtering:
-            episodes = f"{len(visible_rows)} of {len(all_rows)} episodes"
-        else:
-            count = len(all_rows)
-            episodes = f"{count} episode{'s' if count != 1 else ''}"
-
-        parts = [episodes]
-        if shows:
-            parts.append(f"{len(shows)} show{'s' if len(shows) != 1 else ''}")
-        if total_bytes > 0:
-            parts.append(format_size(total_bytes))
-        self._on_ipod_stats_label.setText("  ·  ".join(parts))
-
     def _show_on_ipod_episodes(self) -> None:
         """Show every podcast episode stored on the connected iPod."""
         self._selected_feed = None
-        self._view_mode = _VIEW_ON_IPOD
+        self._begin_episode_view(_VIEW_ON_IPOD)
         self._feed_header.hide()
         self._library_header.show()
         self._episode_by_guid.clear()
@@ -2909,50 +3090,29 @@ class PodcastBrowser(QFrame):
         if tracks is None:
             # The iTunesDB is still being read. Claiming "nothing on this iPod"
             # here would be a lie the user has no way to distinguish.
+            self._episode_source_rows = []
             self._episode_dicts = []
             self._set_episode_rows([], _COMBINED_FEED_COLUMNS)
-            self._on_ipod_stats_label.setText("Reading the iPod…")
+            self._filter_bar.set_summary("Reading the iPod…")
+            self._filter_bar.hide()
             self._show_episode_loading(
                 "Reading the iPod…",
                 "Listing the podcast episodes stored on this iPod.",
             )
             return
 
-        all_rows = self._build_on_ipod_rows(tracks)
-        rows = self._sorted_on_ipod_rows(self._filtered_on_ipod_rows(all_rows))
-        self._update_on_ipod_stats(all_rows, rows)
-
-        self._episode_dicts = rows
-        self._set_episode_rows(rows, _COMBINED_FEED_COLUMNS)
-
-        if rows:
-            self._show_episode_content()
-        elif all_rows:
-            self._show_episode_empty(
-                "No matching episodes",
-                "No episode on this iPod matches your search.",
-                glyph="search",
-            )
-        else:
-            self._show_episode_empty(
-                "No podcasts on this iPod",
+        self._set_episode_source_rows(
+            self._build_on_ipod_rows(tracks),
+            _COMBINED_FEED_COLUMNS,
+            empty_title="No podcasts on this iPod",
+            empty_message=(
                 "Open a show, pick the episodes you want, and add them to "
-                "your iPod. They will be listed here.",
-                glyph="download",
-            )
+                "your iPod. They will be listed here."
+            ),
+            empty_glyph="download",
+        )
 
-    def _on_ipod_sort_changed(self, label: str) -> None:
-        self._on_ipod_sort = _ON_IPOD_SORT_LABELS.get(label, _SORT_NEWEST)
-        if self._view_mode == _VIEW_ON_IPOD:
-            self._show_on_ipod_episodes()
-
-    def _on_ipod_search_typed(self, text: str) -> None:
-        self._on_ipod_query = text
-        self._on_ipod_search_timer.start()
-
-    def _apply_on_ipod_search(self) -> None:
-        if self._view_mode == _VIEW_ON_IPOD:
-            self._show_on_ipod_episodes()
+    # ── Single show view ─────────────────────────────────────────────────
 
     def _show_episodes(self, feed) -> None:
         """Populate the episode list for the given feed."""
@@ -2974,11 +3134,13 @@ class PodcastBrowser(QFrame):
             self._feed_stat_extra.setText("")
             self._load_feed_settings(None)
             self._set_feed_art_placeholder()
+            self._episode_source_rows = []
             self._set_episode_rows([], _PODCAST_EPISODE_COLUMNS)
+            self._filter_bar.hide()
             self._show_episode_content()
             return
 
-        self._view_mode = _VIEW_SHOW
+        self._begin_episode_view(_VIEW_SHOW)
         self._feed_header.show()
         self._feed_title_label.setText(feed.title or "Untitled Podcast")
         self._feed_author_label.setText(feed.author or "Unknown Author")
@@ -3017,23 +3179,23 @@ class PodcastBrowser(QFrame):
         if artwork_source:
             self._load_feed_artwork(artwork_source)
 
-        # Populate episodes (newest first)
-        episodes = sorted(feed.episodes, key=lambda e: e.pub_date or 0, reverse=True)
+        # Feed order is whatever the RSS listed; the filter bar decides how it
+        # is actually shown.
         rows = []
-        for ep in episodes:
+        for ep in feed.episodes:
             key = _episode_key(feed, ep)
             self._episode_by_guid[key] = ep
             self._episode_feed_by_key[key] = feed
             rows.append(self._ep_to_dict(ep, self._episode_status_display(ep)[0], feed))
-        self._episode_dicts = rows
-        self._set_episode_rows(rows, _PODCAST_EPISODE_COLUMNS)
-        if rows:
-            self._show_episode_content()
-        else:
-            self._show_episode_empty(
-                "No episodes found",
-                "This podcast loaded, but its feed did not list any episodes.",
-            )
+
+        self._set_episode_source_rows(
+            rows,
+            _PODCAST_EPISODE_COLUMNS,
+            empty_title="No episodes found",
+            empty_message=(
+                "This podcast loaded, but its feed did not list any episodes."
+            ),
+        )
 
     @staticmethod
     def _episode_status_display(ep):

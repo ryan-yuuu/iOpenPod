@@ -117,13 +117,26 @@ class PodcastStatePanel(QFrame):
         self._progress.show()
         self._action.hide()
 
-    def show_empty(self, title: str, message: str, *, glyph: str = "broadcast") -> None:
+    def show_empty(
+        self,
+        title: str,
+        message: str,
+        *,
+        glyph: str = "broadcast",
+        action_text: str = "",
+    ) -> None:
+        """Show an empty state, optionally offering a way out of it.
+
+        *action_text* is for empty states the user caused and can undo — a
+        search that matched nothing — and emits ``action_clicked``.
+        """
         self._set_icon(glyph, paint_css("text.tertiary"))
         self._title.setText(title)
         self._set_message(message)
         self._code.hide()
         self._progress.hide()
-        self._action.hide()
+        self._action.setText(action_text)
+        self._action.setVisible(bool(action_text))
 
     def show_error(
         self,

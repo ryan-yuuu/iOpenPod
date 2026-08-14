@@ -18,6 +18,7 @@ from iopenpod.gui.widgets.podcastBrowser import (
     _SORT_LARGEST,
     _SORT_OLDEST,
     _SORT_SHOW,
+    _VIEW_ON_IPOD,
     PodcastBrowser,
     _is_synthetic_feed,
 )
@@ -199,7 +200,15 @@ def test_an_unread_database_shows_loading_not_empty(qtbot) -> None:
 
     # Claiming "no podcasts" while the iTunesDB is still parsing would be a lie.
     assert browser._episode_stack.currentIndex() == 1
-    assert "Reading" in browser._on_ipod_stats_label.text()
+    assert "Reading" in browser._filter_bar.summary()
+
+
+def test_an_unread_database_offers_nothing_to_sort_or_search(qtbot) -> None:
+    browser = _browser(qtbot, [], ready=False)
+
+    browser._show_on_ipod_episodes()
+
+    assert browser._filter_bar.isHidden()
 
 
 def test_an_empty_device_says_so(qtbot) -> None:
@@ -237,11 +246,15 @@ def test_the_default_sort_is_most_recently_added(qtbot) -> None:
     ]
 
 
-def test_oldest_first_reverses_the_order(qtbot) -> None:
+def _sorted_by(qtbot, sort_key: str) -> PodcastBrowser:
     browser = _sortable(qtbot)
-    browser._on_ipod_sort = _SORT_OLDEST
-
+    browser._sort_by_view[_VIEW_ON_IPOD] = sort_key
     browser._show_on_ipod_episodes()
+    return browser
+
+
+def test_oldest_first_reverses_the_order(qtbot) -> None:
+    browser = _sorted_by(qtbot, _SORT_OLDEST)
 
     assert [r["Title"] for r in browser._episode_dicts] == [
         "Oldest",
@@ -251,10 +264,7 @@ def test_oldest_first_reverses_the_order(qtbot) -> None:
 
 
 def test_largest_first_answers_what_is_eating_space(qtbot) -> None:
-    browser = _sortable(qtbot)
-    browser._on_ipod_sort = _SORT_LARGEST
-
-    browser._show_on_ipod_episodes()
+    browser = _sorted_by(qtbot, _SORT_LARGEST)
 
     assert [r["Title"] for r in browser._episode_dicts] == [
         "Oldest",
@@ -264,10 +274,7 @@ def test_largest_first_answers_what_is_eating_space(qtbot) -> None:
 
 
 def test_by_show_groups_alphabetically(qtbot) -> None:
-    browser = _sortable(qtbot)
-    browser._on_ipod_sort = _SORT_SHOW
-
-    browser._show_on_ipod_episodes()
+    browser = _sorted_by(qtbot, _SORT_SHOW)
 
     assert [r["podcast_feed_title"] for r in browser._episode_dicts] == [
         "Alpha Show",
@@ -280,7 +287,16 @@ def test_choosing_a_sort_label_reorders_the_list(qtbot) -> None:
     browser = _sortable(qtbot)
     browser._show_on_ipod_episodes()
 
-    browser._on_ipod_sort_combo.setCurrentText("Oldest first")
+    browser._filter_bar._sort.setCurrentText("Oldest first")
+
+    assert browser._episode_dicts[0]["Title"] == "Oldest"
+
+
+def test_the_sort_survives_a_re_render_of_the_same_view(qtbot) -> None:
+    browser = _sorted_by(qtbot, _SORT_OLDEST)
+
+    # A listened toggle or an RSS refresh must not silently reorder the list.
+    browser._refresh_current_view()
 
     assert browser._episode_dicts[0]["Title"] == "Oldest"
 
@@ -288,51 +304,90 @@ def test_choosing_a_sort_label_reorders_the_list(qtbot) -> None:
 # ── Search ──────────────────────────────────────────────────────────────────
 
 
-def test_search_matches_the_episode_title(qtbot) -> None:
+def _searched(qtbot, query: str) -> PodcastBrowser:
+    """Open the view, then type — the order a person would do it in."""
     browser = _sortable(qtbot)
-    browser._on_ipod_query = "old"
-
     browser._show_on_ipod_episodes()
+    browser._filter_bar.set_query(query, notify=True)
+    return browser
+
+
+def test_search_matches_the_episode_title(qtbot) -> None:
+    browser = _searched(qtbot, "old")
 
     assert [r["Title"] for r in browser._episode_dicts] == ["Oldest"]
 
 
 def test_search_matches_the_show_name(qtbot) -> None:
-    browser = _sortable(qtbot)
-    browser._on_ipod_query = "alpha"
-
-    browser._show_on_ipod_episodes()
+    browser = _searched(qtbot, "alpha")
 
     assert [r["Title"] for r in browser._episode_dicts] == ["Newest"]
 
 
-def test_search_is_case_insensitive(qtbot) -> None:
-    browser = _sortable(qtbot)
-    browser._on_ipod_query = "NEWEST"
+def test_search_matches_the_episode_description(qtbot) -> None:
+    # The blurb is what people remember when the title is a number.
+    browser = _searched(qtbot, "Middle description")
 
-    browser._show_on_ipod_episodes()
+    assert [r["Title"] for r in browser._episode_dicts] == ["Middle"]
+
+
+def test_search_is_case_insensitive(qtbot) -> None:
+    browser = _searched(qtbot, "NEWEST")
 
     assert len(browser._episode_dicts) == 1
 
 
-def test_a_search_with_no_hits_says_so_rather_than_looking_empty(qtbot) -> None:
-    browser = _sortable(qtbot)
-    browser._on_ipod_query = "nothing matches this"
+def test_every_search_term_has_to_land(qtbot) -> None:
+    # "alpha" alone matches one row; adding a word no row has must narrow it
+    # to nothing rather than widening the result.
+    browser = _searched(qtbot, "alpha zebra")
 
-    browser._show_on_ipod_episodes()
+    assert browser._episode_dicts == []
+
+
+def test_a_search_with_no_hits_says_so_rather_than_looking_empty(qtbot) -> None:
+    browser = _searched(qtbot, "nothing matches this")
 
     assert browser._episode_dicts == []
     assert browser._episode_stack.currentIndex() == 1
 
 
+def test_a_search_that_hid_everything_keeps_its_own_way_out(qtbot) -> None:
+    browser = _searched(qtbot, "nothing matches this")
+
+    # Hiding the search box along with the rows would strand the user.
+    assert not browser._filter_bar.isHidden()
+
+    browser._retry_episode_state()  # the empty state's "Clear Search" button
+
+    assert len(browser._episode_dicts) == 3
+    assert browser._filter_bar.query() == ""
+
+
+def test_clearing_the_search_restores_the_full_list(qtbot) -> None:
+    browser = _searched(qtbot, "alpha")
+
+    browser._filter_bar.set_query("", notify=True)
+
+    assert len(browser._episode_dicts) == 3
+
+
 def test_select_all_cannot_reach_rows_the_search_hid(qtbot) -> None:
-    browser = _sortable(qtbot)
-    browser._on_ipod_query = "alpha"
-    browser._show_on_ipod_episodes()
+    browser = _searched(qtbot, "alpha")
 
     browser._select_all_visible()
 
     assert len(browser._episode_list.selected_rows()) == 1
+
+
+def test_a_search_survives_a_re_render_of_the_same_view(qtbot) -> None:
+    browser = _searched(qtbot, "alpha")
+
+    # Reconciliation and RSS refreshes redraw the view constantly; wiping the
+    # filter under the user mid-type would be maddening.
+    browser._refresh_current_view()
+
+    assert [r["Title"] for r in browser._episode_dicts] == ["Newest"]
 
 
 # ── The summary line ────────────────────────────────────────────────────────
@@ -343,7 +398,7 @@ def test_the_summary_counts_episodes_shows_and_bytes(qtbot) -> None:
 
     browser._show_on_ipod_episodes()
 
-    text = browser._on_ipod_stats_label.text()
+    text = browser._filter_bar.summary()
     assert "3 episodes" in text
     assert "3 shows" in text
 
@@ -353,17 +408,14 @@ def test_one_episode_reads_in_the_singular(qtbot) -> None:
 
     browser._show_on_ipod_episodes()
 
-    assert "1 episode" in browser._on_ipod_stats_label.text()
-    assert "1 episodes" not in browser._on_ipod_stats_label.text()
+    assert "1 episode" in browser._filter_bar.summary()
+    assert "1 episodes" not in browser._filter_bar.summary()
 
 
 def test_the_summary_shows_the_filtered_share_while_searching(qtbot) -> None:
-    browser = _sortable(qtbot)
-    browser._on_ipod_query = "alpha"
+    browser = _searched(qtbot, "alpha")
 
-    browser._show_on_ipod_episodes()
-
-    assert "1 of 3 episodes" in browser._on_ipod_stats_label.text()
+    assert "1 of 3 episodes" in browser._filter_bar.summary()
 
 
 # ── Removal reaches the sync plan ───────────────────────────────────────────
@@ -575,12 +627,13 @@ def test_an_empty_iPod_with_no_subscriptions_still_pitches_subscribing(qtbot) ->
 
 def test_a_stale_search_does_not_survive_a_device_change(qtbot) -> None:
     browser = _browser(qtbot, [_track(1, "Orphan", "Some Show")])
-    browser._on_ipod_search.setText("nothing matches")
+    browser._show_on_ipod_episodes()
+    browser._filter_bar.set_query("nothing matches", notify=True)
 
     browser.clear()
 
-    assert browser._on_ipod_query == ""
-    assert browser._on_ipod_search.text() == ""
+    assert browser._episode_query == ""
+    assert browser._filter_bar.query() == ""
     assert browser._library_header.isHidden()
 
 
